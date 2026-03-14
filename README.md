@@ -12,6 +12,7 @@ uncompressed, without sacrificing output correctness.
 
 ## Write Up
 **Medium Article** https://medium.com/@bigattichouse/codebook-lossless-llm-compression-10-25-ram-reduction-with-bitwise-generic-packing-of-indexed-c35ba49fc2b8
+
 **Reddit post for Discussion:** https://www.reddit.com/r/LocalLLaMA/comments/1rtbbiw/codebook_lossless_llm_compression_1025_ram/
 
 I demonstrate an LLM compression technique based on bit-packing by trading index lookups for size because model weight value uniqueness is surprisingly low across model components (embeddings, attention, etc.), and even lower for individual layers. Lossless this is around 10–30% smaller than original, quantization/loss at standard sizes with massive increases in mathematical accuracy over traditional methods is also possible. Essentially trading RAM usage for index lookups — so a bit slower.
