@@ -10,6 +10,12 @@ uncompressed, without sacrificing output correctness.
 
 ---
 
+## Write Up
+https://medium.com/@bigattichouse/codebook-lossless-llm-compression-10-25-ram-reduction-with-bitwise-generic-packing-of-indexed-c35ba49fc2b8
+
+
+---
+
 ## How It Works
 
 See **[SYSTEM_OVERVIEW.md](./SYSTEM_OVERVIEW.md)** and
