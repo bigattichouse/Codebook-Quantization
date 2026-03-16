@@ -1,0 +1,30 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# JIT-compiled C/CUDA extensions built at runtime
+*.so
+.cuda_ext_cache/
+
+# Model weight caches (stored alongside the model directory, not in repo)
+*.npz
+*.npy
+
+# Test artefacts
+.pytest_cache/
+*.log
+htmlcov/
+.coverage
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.orig
+
+# OS
+.DS_Store
+Thumbs.db

@@ -20,6 +20,88 @@
 #endif
 
 /* ---------------------------------------------------------------------------
+ * Raw (uncompressed) matmul
+ * ---------------------------------------------------------------------------
+ *
+ * raw_matmul_f32
+ *
+ *   x      : (T, K)  float32, row-major — input activations
+ *   weight : (M, K)  float32, row-major — plain float weight matrix
+ *   out    : (T, M)  float32, row-major — output (caller must zero-init)
+ *   T, M, K: dimensions
+ *
+ * Equivalent to: out = x @ weight.T
+ * No codebook, no bit-packing. With -O3 -march=native gcc auto-vectorises.
+ */
+void
+raw_matmul_f32(
+        const float *x,
+        const float *weight,
+        float       *out,
+        int T, int M, int K)
+{
+    #pragma omp parallel for schedule(static)
+    for (int r = 0; r < M; r++) {
+        const float *wr = weight + (int64_t)r * K;
+        for (int k = 0; k < K; k++) {
+            float w = wr[k];
+            for (int t = 0; t < T; t++)
+                out[t * M + r] += x[t * K + k] * w;
+        }
+    }
+}
+
+/*
+ * raw_matmul_f32_chunk
+ *
+ * Same as above but processes only rows [r_start, r_end).
+ * Allows streaming large layers with a fixed working set.
+ */
+void
+raw_matmul_f32_chunk(
+        const float *x,
+        const float *weight,
+        float       *out,
+        int T, int M, int K,
+        int r_start, int r_end)
+{
+    if (r_end > M) r_end = M;
+
+    #pragma omp parallel for schedule(static)
+    for (int r = r_start; r < r_end; r++) {
+        const float *wr = weight + (int64_t)r * K;
+        for (int k = 0; k < K; k++) {
+            float w = wr[k];
+            for (int t = 0; t < T; t++)
+                out[t * M + r] += x[t * K + k] * w;
+        }
+    }
+}
+
+/*
+ * raw_embedding_f32
+ *
+ *   token_ids : (T,)        int32  — token IDs
+ *   weight    : (vocab, H)  float32 row-major — full embedding table
+ *   out       : (T, H)      float32 row-major — output (caller allocs)
+ *
+ * Equivalent to: out = weight[token_ids]
+ */
+void
+raw_embedding_f32(
+        const int32_t *token_ids,
+        const float   *weight,
+        float         *out,
+        int T, int H)
+{
+    #pragma omp parallel for schedule(static)
+    for (int t = 0; t < T; t++) {
+        int32_t tid = token_ids[t];
+        memcpy(out + (int64_t)t * H, weight + (int64_t)tid * H, (size_t)H * sizeof(float));
+    }
+}
+
+/* ---------------------------------------------------------------------------
  * Bit unpacking helpers
  * ------------------------------------------------------------------------- */
 

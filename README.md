@@ -10,15 +10,6 @@ uncompressed, without sacrificing output correctness.
 
 ---
 
-## Write Up
-**Medium Article** https://medium.com/@bigattichouse/codebook-lossless-llm-compression-10-25-ram-reduction-with-bitwise-generic-packing-of-indexed-c35ba49fc2b8
-
-**Reddit post for Discussion:** https://www.reddit.com/r/LocalLLaMA/comments/1rtbbiw/codebook_lossless_llm_compression_1025_ram/
-
-I demonstrate an LLM compression technique based on bit-packing by trading index lookups for size because model weight value uniqueness is surprisingly low across model components (embeddings, attention, etc.), and even lower for individual layers. Lossless this is around 10–30% smaller than original, quantization/loss at standard sizes with massive increases in mathematical accuracy over traditional methods is also possible. Essentially trading RAM usage for index lookups — so a bit slower.
-
----
-
 ## How It Works
 
 See **[SYSTEM_OVERVIEW.md](./SYSTEM_OVERVIEW.md)** and
@@ -50,7 +41,13 @@ python -m venv venv
 ./venv/bin/pip install -r requirements.txt
 ```
 
-Requires: PyTorch ≥ 2.5 with CUDA or ROCm, transformers ≥ 5.0, gcc (for C kernel).
+Requires: PyTorch ≥ 2.4 with CUDA or ROCm, transformers ≥ 4.57, gcc (for C kernel).
+
+For ROCm (AMD), install the ROCm wheel explicitly — the default PyPI torch is CPU-only:
+```bash
+./venv/bin/pip install torch torchvision torchaudio \
+    --index-url https://download.pytorch.org/whl/rocm6.0
+```
 
 For AMD GPU (MI50 / ROCm) setup, see the MI50_ROCM_SETUP.md doc included with this package.
 
@@ -82,6 +79,9 @@ prints a summary table.
 
 ```bash
 ./venv/bin/python chat.py ~/workspace/model/Qwen3-1.7B --device cuda
+
+# Enable Qwen3 chain-of-thought reasoning (off by default):
+./venv/bin/python chat.py ~/workspace/model/Qwen3-1.7B --device cuda --thinking
 ```
 
 ---
@@ -184,8 +184,8 @@ INFERENCE_RECOVERY_PLAN.md — diagnostic phases, root-cause taxonomy, fix log
   on GPU.  CPU mode is ~52× slower and intended for correctness testing only.
 - **Compression time**: offline compression is slow (~60 min for 1.7B, CPU-only).
 - **Thinking mode**: Qwen3 models generate a `<think>` block by default, adding
-  many tokens before the visible response.  Pass `enable_thinking=False` to
-  suppress it for cleaner benchmarks.
+  many tokens before the visible response.  Thinking is disabled by default;
+  pass `--thinking` to enable it.
 
 ---
 

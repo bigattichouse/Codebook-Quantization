@@ -1,6 +1,48 @@
-torch
+# ── PyTorch (ROCm) ────────────────────────────────────────────────────────────
+# Install from AMD's ROCm index, not PyPI:
+#
+#   AMD MI50 / gfx906 (ROCm 6.3, Triton 3.5.1 — best gfx906 chance):
+#     pip install torch torchvision torchaudio \
+#         --index-url https://download.pytorch.org/whl/rocm6.3
+#
+#   NVIDIA CUDA 12.x:
+#     pip install torch torchvision torchaudio \
+#         --index-url https://download.pytorch.org/whl/cu121
+#
+#   CPU-only fallback:
+#     pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+# ── Core ──────────────────────────────────────────────────────────────────────
+torch                           # see above for the correct index URL
 numpy
-transformers
+transformers>=4.57.0            # qwen3_5 model type requires 4.57+
 safetensors
-psutil
 accelerate
+psutil
+
+# ── Optional but recommended ──────────────────────────────────────────────────
+scipy                           # used by some analysis utilities
+sentencepiece                   # tokenizer for some model families
+protobuf                        # required by some tokenizers
+
+# ── Fast SSM / linear-attention kernels (AMD ROCm, gfx906) ───────────────────
+# causal-conv1d must be built from source against the system ROCm hipcc.
+# See README or run:
+#
+#   ROCM_PATH=/opt/rocm-7.2.0 HIP_HOME=/opt/rocm-7.2.0 HIP_ARCHITECTURES=gfx906 \
+#     pip install /tmp/causal_conv1d-1.6.1 --no-build-isolation
+#
+# Note: -mcode-object-version=5 patch is required for ROCm 7.2 hipcc +
+# PyTorch ROCm 6.x runtime (COV mismatch).  The patched source lives at
+# /tmp/causal_conv1d-1.6.1 after extracting from pip download.
+#
+# flash-linear-attention requires Triton.  With PyTorch ROCm 6.3 / Triton 3.5.1
+# gfx906 support may be available:
+#   pip install flash-linear-attention
+#
+# With PyTorch ROCm 6.0 / Triton 3.0.0, gfx906 is unsupported — skip.
+
+# ── Build tools (system packages, not pip) ────────────────────────────────────
+# gcc -O3 -march=native -fopenmp          (for src/compressed_matmul.c)
+# hipcc + rocminfo + hipcub-dev7.2.0      (for rocm/compressed_kernel.hip)
+#   sudo apt install hipcub-dev7.2.0

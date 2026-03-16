@@ -1,7 +1,5 @@
 # AMD Radeon Instinct MI50 32G — Setup Guide
 
-## THIS IS A WORK IN PROGRESS AND NOT READY FOR PRODUCTION USE
-
 **Hardware**: Radeon Instinct MI50, 32 GB HBM2, gfx906 (Vega20)
 **Short answer**: Yes, this project works on the MI50.  The 32 GB VRAM is
 large enough to run Qwen3-7B and likely Qwen2.5-14B fully compressed.

@@ -24,6 +24,18 @@ from transformers import AutoModelForCausalLM
 
 from name_resolver import NameResolver
 from rope_utils import reinit_rope_buffers
+from memory_utils import resolve_device
+
+try:
+    from ssm_kernel_ops import inject_ssm_kernels
+    _SSM_KERNELS_AVAILABLE = True
+except Exception:
+    _SSM_KERNELS_AVAILABLE = False
+
+# Note: inject_ssm_kernels patches recurrent_gated_delta_rule (seq_len=1 decode)
+# only.  chunk_gated_delta_rule (prefill) is kept as the Python fallback because
+# torch_chunk_gated_delta_rule already uses rocBLAS for intra-chunk GEMMs and
+# is faster than our sequential HIP kernel for large T.
 
 try:
     from compressed_modules import AdaptiveCodebookLinear, AdaptiveCodebookEmbedding
@@ -51,16 +63,19 @@ class CompressedModelLoader:
         self.use_compressed_modules = use_compressed_modules and _COMPRESSED_MODULES_AVAILABLE
         self.use_mmap = use_mmap
         self.modules_replaced = 0
+        self._cpu_init = False   # set True when model shell is materialized on CPU
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def create_and_load(self, config, model_dtype, resolver: NameResolver):
-        """Full pipeline: meta → device → weights → compressed modules → RoPE fix.
+        """Full pipeline: meta → CPU → weights → compressed modules → GPU → RoPE fix.
 
+        Large models (>VRAM capacity) are materialized on CPU first.  Compressed
+        modules upload their indices/codebooks directly to GPU during replacement,
+        so the final model runs GPU-accelerated regardless of initial materialization.
         Returns the ready-to-use model in eval mode.
-        Raises RuntimeError on unrecoverable errors; OOM on GPU falls back to CPU.
         """
         model = self._create_on_meta(config, model_dtype)
         model = self._materialize(model, model_dtype)
@@ -71,11 +86,30 @@ class CompressedModelLoader:
             self._replace_modules_recursive(model, resolver, self.codebooks)
             print(f"   ✅ Layer replacement complete! ({self.modules_replaced} modules)")
 
+        # Move non-replaced parameters (norms, biases, embeddings kept exact) to the
+        # inference device.  AdaptiveCodebook* modules already hold their data on GPU
+        # and are unaffected by this call.
+        if self._cpu_init and self.device != 'cpu':
+            print(f"\n  Moving remaining parameters to {self.device}...")
+            model.to(device=self.device)
+
         # dtype cast must come before RoPE reinit so we can detect bfloat16 inv_freq
         model.to(model_dtype)
         reinit_rope_buffers(model, config)
 
+        if _SSM_KERNELS_AVAILABLE:
+            inject_ssm_kernels(model)
+
         model.eval()
+
+        # Free preloaded tensor cache — all data has been transferred to GPU
+        # modules or exact-weight parameters.  Keeping it would hold gigabytes
+        # of compressed numpy arrays in CPU RAM for the lifetime of the process.
+        if hasattr(self.compressor, '_loaded_weights') and self.compressor._loaded_weights:
+            remaining = len(self.compressor._loaded_weights)
+            if remaining:
+                print(f"  Freeing {remaining} unused preloaded tensors from CPU RAM...")
+            self.compressor._loaded_weights.clear()
         gc.collect()
         return model
 
@@ -88,23 +122,21 @@ class CompressedModelLoader:
         print(f"\nCreating model on meta device (zero memory, dtype={model_dtype})...")
         with torch.device('meta'):
             return AutoModelForCausalLM.from_config(
-                config, trust_remote_code=True, dtype=model_dtype
+                config, trust_remote_code=True
             )
 
     def _materialize(self, model, model_dtype):
-        """Move meta model to target device, falling back to CPU on OOM."""
-        print(f"\n📌 Moving model to {self.device} ({model_dtype})...")
-        try:
-            model.to_empty(device=self.device)
-        except (RuntimeError, torch.cuda.OutOfMemoryError) as exc:
-            if self.device != 'cpu' and 'memory' in str(exc).lower():
-                print(f"  ⚠️  GPU OOM — model too large for VRAM. Falling back to CPU.")
-                print(f"     (Compressed weights stay on CPU; GPU kernel still active for matmul.)")
-                self.device = 'cpu'
-                self.codebooks = {k: v.cpu() for k, v in self.codebooks.items()}
-                model.to_empty(device='cpu')
-            else:
-                raise
+        """Materialize meta model on CPU first.
+
+        For compressed inference the heavy Linear/Embedding weights are replaced
+        by compact GPU-side modules, so materializing on CPU avoids a transient
+        VRAM allocation larger than what the compressed model actually needs.
+        After _replace_modules_recursive the remaining shell is moved to the
+        inference device in create_and_load().
+        """
+        print(f"\n📌 Materializing model shell on CPU (inference device: {self.device})...")
+        model.to_empty(device='cpu')
+        self._cpu_init = True
         return model
 
     def _load_exact_weights(self, model, resolver: NameResolver):
@@ -151,6 +183,8 @@ class CompressedModelLoader:
                 param.data.copy_(tensor.reshape(param.shape))
                 del tensor, data
                 loaded += 1
+                if hasattr(self.compressor, '_loaded_weights'):
+                    self.compressor._loaded_weights.pop(resolved, None)
 
         print(f"  Loaded {loaded} exact tensors "
               f"(skipped {skipped} codebook tensors — Linear/Embedding will be replaced)")
@@ -158,7 +192,7 @@ class CompressedModelLoader:
     def _replace_modules_recursive(self, module, resolver: NameResolver,
                                    global_codebooks: dict, prefix: str = ""):
         """Walk model tree and swap nn.Linear / nn.Embedding with compressed variants."""
-        use_gpu = (self.device != 'cpu')
+        use_gpu = (resolve_device(self.device) != 'cpu')
 
         for name, child in list(module.named_children()):
             full_name = f"{prefix}.{name}" if prefix else name
@@ -195,6 +229,9 @@ class CompressedModelLoader:
             new_layer.bias = child.bias.data.clone().detach()
         setattr(parent, attr_name, new_layer)
         self.modules_replaced += 1
+        # Free the preloaded numpy data now that it lives in the GPU module.
+        if hasattr(self.compressor, '_loaded_weights'):
+            self.compressor._loaded_weights.pop(resolved, None)
 
     def _try_replace_embedding(self, parent, attr_name, full_name, child,
                                 resolver, global_codebooks, use_gpu):
@@ -212,3 +249,6 @@ class CompressedModelLoader:
         )
         setattr(parent, attr_name, new_layer)
         self.modules_replaced += 1
+        # Free the preloaded numpy data now that it lives in the GPU module.
+        if hasattr(self.compressor, '_loaded_weights'):
+            self.compressor._loaded_weights.pop(resolved, None)

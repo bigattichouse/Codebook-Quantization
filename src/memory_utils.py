@@ -8,6 +8,24 @@ from typing import Dict
 import torch
 
 
+def resolve_device(requested: str = 'cuda') -> str:
+    """Return the effective PyTorch device string.
+
+    Falls back to 'cpu' when CUDA/ROCm isn't visible to PyTorch.
+    GPU compute via direct HIP ctypes kernels (AdaptiveCodebookLinear etc.)
+    still runs on-device even when PyTorch tensors live in CPU memory.
+    """
+    if requested == 'cpu':
+        return 'cpu'
+    return requested if torch.cuda.is_available() else 'cpu'
+
+
+def synchronize() -> None:
+    """Synchronize CUDA/ROCm device if available; no-op otherwise."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
 def get_memory_stats() -> Dict[str, float]:
     """Return current CPU RSS and GPU allocated memory in GB."""
     stats: Dict[str, float] = {}

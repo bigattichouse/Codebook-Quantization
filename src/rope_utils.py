@@ -96,6 +96,8 @@ def reinit_rope_buffers(model, config) -> int:
         if hasattr(module, 'original_inv_freq'):
             orig = module.original_inv_freq
             if orig is not None and orig.numel() == half_dim:
+                # Remove existing buffer first to avoid "already exists" error
+                delattr(module, 'original_inv_freq')
                 module.register_buffer('original_inv_freq', inv_freq.clone(), persistent=False)
 
         reinitialized += 1

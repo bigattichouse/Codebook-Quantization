@@ -252,20 +252,27 @@ class OnTheFlyCompressor:
     def __init__(self, model_path: Path, cache_dir: Optional[Path] = None,
                  embedding_size: int = 4096, mlp_size: int = 256,
                  force_rebuild: bool = False, compression_mode: str = 'balanced',
-                 store_in_model: bool = True):
+                 store_in_model: bool = True, snr_threshold_db: Optional[float] = None):
         self.model_path = model_path
         self.embedding_size = embedding_size
         self.mlp_size = mlp_size
         self.force_rebuild = force_rebuild
-        
-        # Determine cache directory
+        self.snr_threshold_db = snr_threshold_db
+
+        # Determine cache directory — named by quality level so multiple
+        # quality tiers can coexist under the same model directory.
         if cache_dir:
             self.cache_dir = cache_dir
         elif store_in_model:
-            self.cache_dir = model_path / "codebook"
+            if compression_mode == 'lossless':
+                self.cache_dir = model_path / "codebook-lossless"
+            elif snr_threshold_db is not None:
+                self.cache_dir = model_path / f"codebook-{int(snr_threshold_db)}dB"
+            else:
+                self.cache_dir = model_path / "codebook"  # legacy fallback
         else:
             self.cache_dir = model_path.parent / f".{model_path.name}_cache"
-        
+
         self.compression_mode = compression_mode
         self.codebooks = {}
         self.tensor_info = {}

@@ -144,11 +144,6 @@ def _compress_adaptive_worker(name, file_path, offset, size, shape, dtype_str,
     if unique_count is None:
         unique_count = len(np.unique(flat))
 
-    # Sample signal power now so flat can be freed before packing (avoids flat + packed coexisting)
-    _snr_sample = flat[:min(50000, len(flat))]
-    signal_power = float(np.mean(_snr_sample.astype(np.float64) ** 2))
-    del _snr_sample
-    
     # 1. Critical Layer Detection
     # These layers are sensitive and MUST be bit-perfect (0% loss)
     is_critical = any(k in name_low for k in ['norm', 'ln_', 'router', 'ssm_core'])
@@ -162,13 +157,23 @@ def _compress_adaptive_worker(name, file_path, offset, size, shape, dtype_str,
         }, 'exact (tiny)', unique_count, 0.0, 100.0
 
     # 2. Quality Thresholds
-    if is_critical:
-        # Critical layers REQUIRE bit-perfect reconstruction regardless of mode
+    # For balanced/lossy modes, use SNR (dB) instead of absolute MSE.
+    # SNR is scale-invariant: a tensor with signal_power=0.001 and MSE=0.0002
+    # has SNR ≈ 7 dB (terrible), while the same MSE on a normal-scale tensor
+    # (signal_power=1.0) gives SNR ≈ 37 dB (excellent).
+    # Lossless and critical tensors keep the absolute MSE check (≤ 1e-9).
+    if is_critical or compression_mode == 'lossless':
         threshold = 1e-9
-    else:
-        threshold = {
-            'lossless': 1e-9, 'balanced': 0.0002, 'adaptive': 0.0002, 'lossy': 0.001
-        }.get(compression_mode, mse_threshold)
+        snr_threshold_db = None  # use absolute MSE
+    elif compression_mode == 'balanced':
+        threshold = None
+        snr_threshold_db = 30.0  # ≥ 30 dB SNR required
+    elif compression_mode == 'lossy':
+        threshold = None
+        snr_threshold_db = 25.0  # ≥ 25 dB SNR required
+    else:  # adaptive or custom mse_threshold
+        threshold = mse_threshold
+        snr_threshold_db = None
 
     def get_mse(reconstructed, original):
         return float(np.mean((original - reconstructed) ** 2))
@@ -191,6 +196,21 @@ def _compress_adaptive_worker(name, file_path, offset, size, shape, dtype_str,
         del _idx
     else:
         flat_sample = flat
+
+    # Signal power for SNR calculations (scale-invariant quality metric).
+    signal_power = float(np.mean(flat_sample.astype(np.float32) ** 2))
+
+    def quality_passes(mse: float) -> bool:
+        """Return True if MSE meets the quality bar (SNR-based or absolute)."""
+        if snr_threshold_db is not None:
+            if mse < 1e-12:
+                return True  # essentially perfect
+            if signal_power < 1e-12:
+                return False  # near-zero tensor, can't compress meaningfully
+            snr = 10.0 * np.log10(signal_power / mse)
+            return snr >= snr_threshold_db
+        else:
+            return mse <= threshold
 
     # --- Targeted bit-width search (2–4 checks max, not a full scan) ---
     #
@@ -227,7 +247,7 @@ def _compress_adaptive_worker(name, file_path, offset, size, shape, dtype_str,
     if global_cb is not None:
         bits_g = int(np.ceil(np.log2(len(global_cb))))
         mse_g = get_mse(global_cb[assign_to_codebook(flat_sample, global_cb)], flat_sample)
-        if mse_g <= threshold:
+        if quality_passes(mse_g):
             min_bits = bits_g
             best_strategy = {
                 'mode': 'direct_codebook', 'indices': None, 'bits': bits_g,
@@ -238,7 +258,6 @@ def _compress_adaptive_worker(name, file_path, offset, size, shape, dtype_str,
     # 2. Targeted candidate search — ascending (most compressed first), stop at first pass.
     # Lossless uses threshold (1e-9) not strict 0.0: k-means at min_bits_exact-1 with
     # 99.999%+ coverage achieves MSE ~1e-15, well within the threshold.
-    target_mse = threshold
     for bits in search_candidates:
         if bits >= min_bits: continue
 
@@ -269,7 +288,7 @@ def _compress_adaptive_worker(name, file_path, offset, size, shape, dtype_str,
             idx_sample = assign_to_codebook(flat_sample, cb_km)
             mse_km = get_mse(cb_km[idx_sample], flat_sample)
             del idx_sample
-            if mse_km <= target_mse:
+            if quality_passes(mse_km):
                 min_bits = bits
                 _step(f"assigning {flat.size//1_000_000}M values ({bits}-bit)...")
                 best_strategy = {
@@ -289,7 +308,7 @@ def _compress_adaptive_worker(name, file_path, offset, size, shape, dtype_str,
         q_s = np.round((flat_sample - v_min) / scale).clip(0, k - 1)
         mse_lin = get_mse(q_s * scale + v_min, flat_sample)
         del q_s
-        if mse_lin <= threshold:
+        if quality_passes(mse_lin):
             v_min_f, v_max_f = flat.min(), flat.max()
             scale_f = (v_max_f - v_min_f) / (k - 1) if v_max_f > v_min_f else 1.0
             q_full = np.round((flat - v_min_f) / scale_f).clip(0, k - 1)
@@ -351,14 +370,28 @@ class AdaptiveCompressor(OnTheFlyCompressor):
                  compression_mode: str = 'balanced', sample_size: Optional[int] = None,
                  force_rebuild: bool = False, store_in_model: bool = True,
                  num_workers: Optional[int] = None, mse_threshold: float = 0.005,
-                 target_bits: Optional[int] = None):
+                 target_bits: Optional[int] = None, snr_db: Optional[float] = None):
+        # Resolve SNR target: explicit --db overrides mode default.
+        # Modes are convenience aliases for dB targets; lossless uses absolute MSE.
+        if snr_db is not None:
+            snr_threshold_db = float(snr_db)
+        elif compression_mode == 'balanced':
+            snr_threshold_db = 30.0
+        elif compression_mode == 'lossy':
+            snr_threshold_db = 25.0
+        else:
+            snr_threshold_db = None  # lossless / exact: MSE-based
+
         super().__init__(
             model_path=model_path,
             cache_dir=cache_dir,
             compression_mode=compression_mode,
             force_rebuild=force_rebuild,
-            store_in_model=store_in_model
+            store_in_model=store_in_model,
+            snr_threshold_db=snr_threshold_db,
         )
+        self.snr_threshold_db = snr_threshold_db
+        self._snr_values: list = []  # collect per-tensor actual SNR for reporting
         self.sample_size = sample_size
         self.num_workers = num_workers or cpu_count()
         self.mse_threshold = mse_threshold
@@ -710,8 +743,20 @@ class AdaptiveCompressor(OnTheFlyCompressor):
         categories = ['embedding', 'attention', 'mlp_ffn', 'moe_expert', 'router', 'ssm_core']
         category_hists = {k: np.zeros(hist_size, dtype=np.uint64) for k in categories}
         
-        # Load config and scan metadata
-        st_files = sorted(self.model_path.glob("*.safetensors"))
+        # Load config and scan metadata.
+        # Prefer model.safetensors.index.json — it lists exactly the shard files
+        # that HuggingFace uses, excluding alternative-format files like Mistral's
+        # consolidated.safetensors (which uses different tensor naming conventions
+        # and would cause double-counting if included).
+        index_path = self.model_path / "model.safetensors.index.json"
+        if index_path.exists():
+            with open(index_path) as _f:
+                _idx = json.load(_f)
+            _shard_names = sorted(set(_idx["weight_map"].values()))
+            st_files = [self.model_path / n for n in _shard_names]
+            print(f"  Using model.safetensors.index.json ({len(st_files)} shards)")
+        else:
+            st_files = sorted(self.model_path.glob("*.safetensors"))
         for st_file in st_files:
             with open(st_file, 'rb') as f:
                 header_size = int.from_bytes(f.read(8), 'little')
@@ -961,6 +1006,8 @@ class AdaptiveCompressor(OnTheFlyCompressor):
                 total_original_bytes += orig_size
                 total_compressed_bytes += comp_size
                 self.strategy_stats[result['mode']] = self.strategy_stats.get(result['mode'], 0) + 1
+                if snr < 99.0:  # exclude exact/lossless (reported as 100 dB)
+                    self._snr_values.append(snr)
 
                 del result  # free compressed data immediately after saving
 
@@ -981,6 +1028,17 @@ class AdaptiveCompressor(OnTheFlyCompressor):
         total_time = time.time() - start_time
         print(f"  Compression complete: {compressed_count} tensors in {total_time:.1f}s")
         
+        snr_vals = self._snr_values
+        snr_summary = {}
+        if snr_vals:
+            snr_summary = {
+                'snr_target_db':  self.snr_threshold_db,
+                'snr_actual_min': round(min(snr_vals), 2),
+                'snr_actual_mean': round(sum(snr_vals) / len(snr_vals), 2),
+                'snr_actual_max': round(max(snr_vals), 2),
+                'snr_n_tensors':  len(snr_vals),
+            }
+
         metadata = {
             'compression_method': 'adaptive_streaming',
             'original_size_gb': total_original_bytes / 1e9,
@@ -988,7 +1046,8 @@ class AdaptiveCompressor(OnTheFlyCompressor):
             'tensor_count': compressed_count,
             'compression_time_s': total_time,
             'strategy_stats': getattr(self, 'strategy_stats', {}),
-            'config': getattr(self, 'config', {})
+            'config': getattr(self, 'config', {}),
+            **snr_summary,
         }
 
         return self._loaded_weights, metadata
@@ -1074,6 +1133,16 @@ class AdaptiveCompressor(OnTheFlyCompressor):
             np.save(codebook_path, codebook)
         
         # Save metadata
+        snr_vals = getattr(self, '_snr_values', [])
+        snr_summary = {}
+        if snr_vals:
+            snr_summary = {
+                'snr_target_db':   getattr(self, 'snr_threshold_db', None),
+                'snr_actual_min':  round(min(snr_vals), 2),
+                'snr_actual_mean': round(sum(snr_vals) / len(snr_vals), 2),
+                'snr_actual_max':  round(max(snr_vals), 2),
+                'snr_n_tensors':   len(snr_vals),
+            }
         metadata = {
             'compression_method': 'adaptive_v2',
             'compression_mode': self.compression_mode,
@@ -1082,7 +1151,8 @@ class AdaptiveCompressor(OnTheFlyCompressor):
             'model_hash': self.model_hash,
             'tensor_info': self.tensor_info,
             'accuracy_stats': getattr(self, 'accuracy_stats', {}),
-            'config': getattr(self, 'config', {})
+            'config': getattr(self, 'config', {}),
+            **snr_summary,
         }
         
         metadata_path = cache_dir / "metadata.json"

@@ -121,6 +121,40 @@ def _build_lib():
         ctypes.c_int,                     # r_end
     ]
 
+    # raw_matmul_f32
+    lib.raw_matmul_f32.restype = None
+    lib.raw_matmul_f32.argtypes = [
+        ctypes.POINTER(ctypes.c_float),   # x      [T, K]
+        ctypes.POINTER(ctypes.c_float),   # weight [M, K]
+        ctypes.POINTER(ctypes.c_float),   # out    [T, M]
+        ctypes.c_int,                     # T
+        ctypes.c_int,                     # M
+        ctypes.c_int,                     # K
+    ]
+
+    # raw_matmul_f32_chunk
+    lib.raw_matmul_f32_chunk.restype = None
+    lib.raw_matmul_f32_chunk.argtypes = [
+        ctypes.POINTER(ctypes.c_float),   # x
+        ctypes.POINTER(ctypes.c_float),   # weight
+        ctypes.POINTER(ctypes.c_float),   # out
+        ctypes.c_int,                     # T
+        ctypes.c_int,                     # M
+        ctypes.c_int,                     # K
+        ctypes.c_int,                     # r_start
+        ctypes.c_int,                     # r_end
+    ]
+
+    # raw_embedding_f32
+    lib.raw_embedding_f32.restype = None
+    lib.raw_embedding_f32.argtypes = [
+        ctypes.POINTER(ctypes.c_int),     # token_ids [T]
+        ctypes.POINTER(ctypes.c_float),   # weight    [vocab, H]
+        ctypes.POINTER(ctypes.c_float),   # out       [T, H]
+        ctypes.c_int,                     # T
+        ctypes.c_int,                     # H
+    ]
+
     return lib
 
 
@@ -248,3 +282,80 @@ def compressed_matmul(x_np, packed_np, codebook_np, M, K, bits,
             del chunk_w, idx
 
     return out_np.reshape(*orig_shape[:-1], M)
+
+
+def _ptr_i32(arr):
+    return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
+
+
+def raw_matmul(x_np, weight_np, M, K, chunk_rows=None):
+    """
+    Compute y = x @ weight.T where weight is a plain float32 matrix.
+
+    No codebook, no bit-packing — standard dense linear layer.
+
+    Args:
+        x_np      : (T, K) float32 numpy array or torch tensor
+        weight_np : (M, K) float32 numpy array or torch tensor (row-major)
+        M         : output features
+        K         : input features
+        chunk_rows: rows per C call; None = all at once
+
+    Returns:
+        (T, M) float32 numpy array
+    """
+    x_f32 = _as_f32(x_np)
+    w_f32 = _as_f32(weight_np)
+
+    orig_shape = x_f32.shape
+    x_f32 = x_f32.reshape(-1, K)
+    T = x_f32.shape[0]
+
+    out_np = np.zeros((T, M), dtype=np.float32)
+
+    lib = _get_lib()
+    if lib:
+        cr = chunk_rows or _CHUNK_ROWS
+        r = 0
+        while r < M:
+            r_end = min(r + cr, M)
+            lib.raw_matmul_f32_chunk(
+                _ptr_f32(x_f32), _ptr_f32(w_f32), _ptr_f32(out_np),
+                T, M, K, r, r_end
+            )
+            r = r_end
+    else:
+        # Numpy fallback
+        out_np = (x_f32 @ w_f32.T)
+
+    return out_np.reshape(*orig_shape[:-1], M)
+
+
+def raw_embedding(token_ids_np, weight_np, H):
+    """
+    Standard embedding lookup: out[t] = weight[token_ids[t]].
+
+    Args:
+        token_ids_np : (T,) int32/int64 numpy array or torch tensor
+        weight_np    : (vocab, H) float32 numpy array or torch tensor
+        H            : hidden size
+
+    Returns:
+        (T, H) float32 numpy array
+    """
+    if hasattr(token_ids_np, 'cpu'):
+        ids = np.ascontiguousarray(token_ids_np.cpu().numpy().astype(np.int32))
+    else:
+        ids = np.ascontiguousarray(token_ids_np.astype(np.int32))
+
+    w_f32 = _as_f32(weight_np)
+    T = len(ids)
+    out_np = np.zeros((T, H), dtype=np.float32)
+
+    lib = _get_lib()
+    if lib:
+        lib.raw_embedding_f32(_ptr_i32(ids), _ptr_f32(w_f32), _ptr_f32(out_np), T, H)
+    else:
+        out_np = w_f32[ids]
+
+    return out_np
