@@ -465,7 +465,13 @@ class OnTheFlyCompressor:
             raw = data['data']
             return (raw.astype(np.uint32) << 16).view(np.float32).reshape(data['shape'])
         elif mode == 'direct_codebook':
-            indices = data['indices']
+            if data.get('encoding') == 'huffman':
+                from huffman_codebook import huffman_decode_indices
+                indices = huffman_decode_indices(
+                    data['huff_stream'], data['huff_lengths'], int(data['huff_n'][0])
+                )
+            else:
+                indices = data['indices']
             cb = data.get('codebook') or self.codebooks.get(data.get('codebook_type'))
             if cb is None: return None
             return cb[indices].reshape(data['shape'])

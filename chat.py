@@ -129,6 +129,7 @@ class CompressedChatModel:
             store_in_model=True,
             force_rebuild=self.force_rebuild,
             mse_threshold=mse_target,
+            entropy_code=self.entropy_code,
         )
         # load_tensors=True uses ThreadPoolExecutor to preload all npz files in
         # parallel.  This is much faster than sequential on-demand loading because

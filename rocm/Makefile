@@ -1,16 +1,18 @@
-# Makefile for libcompressed_kernel.so
+# Makefile for libcompressed_kernel.so and libhuffman_kernel.so
 #
 # Detects AMD GPU architecture automatically via rocminfo.
 # Override with:  make ARCH=gfx1100
 #
 # Targets:
-#   make          — build shared library
-#   make test     — build and run the sanity-check binary
-#   make clean    — remove build artifacts
+#   make              — build both shared libraries
+#   make huffman      — build only libhuffman_kernel.so
+#   make test         — build and run the sanity-check binary
+#   make clean        — remove build artifacts
 
-HIPCC  := hipcc
-TARGET := libcompressed_kernel.so
-TEST   := test_kernel
+HIPCC        := hipcc
+TARGET       := libcompressed_kernel.so
+HUFF_TARGET  := libhuffman_kernel.so
+TEST         := test_kernel
 
 # Detect GPU architecture (first gfxXXXX found in rocminfo output)
 ARCH := $(shell rocminfo 2>/dev/null | grep -o 'gfx[0-9a-z]*' | head -1)
@@ -42,13 +44,19 @@ else
   HIP_RPATH :=
 endif
 
-.PHONY: all test clean
+.PHONY: all huffman test clean
 
-all: $(TARGET)
-	@echo "Built $(TARGET) for $(ARCH)"
+all: $(TARGET) $(HUFF_TARGET)
+	@echo "Built $(TARGET) and $(HUFF_TARGET) for $(ARCH)"
 
 $(TARGET): compressed_kernel.hip compressed_kernel.h
 	$(HIPCC) $(CFLAGS) $(HIP_RPATH) -shared -o $@ compressed_kernel.hip
+
+huffman: $(HUFF_TARGET)
+
+$(HUFF_TARGET): huffman_kernel.hip huffman_kernel.h
+	$(HIPCC) $(CFLAGS) $(HIP_RPATH) -shared -o $@ huffman_kernel.hip
+	@echo "Built $(HUFF_TARGET) for $(ARCH)"
 
 # Minimal correctness test — no external dependencies
 test: $(TARGET) test_kernel.cpp
@@ -57,4 +65,4 @@ test: $(TARGET) test_kernel.cpp
 	./$(TEST)
 
 clean:
-	rm -f $(TARGET) $(TEST)
+	rm -f $(TARGET) $(HUFF_TARGET) $(TEST)

@@ -602,9 +602,19 @@ class AdaptiveCompressor(OnTheFlyCompressor):
             return w.reshape(data['shape'])
         
         elif mode == 'direct_codebook':
-            indices = data['indices']
             bits = data.get('bits', 8)
-            
+
+            # Huffman-encoded: decode to raw indices first
+            if data.get('encoding') == 'huffman':
+                from huffman_codebook import huffman_decode_indices
+                from bitpack import pack_any_bits
+                raw = huffman_decode_indices(
+                    data['huff_stream'], data['huff_lengths'], int(data['huff_n'][0])
+                )
+                indices = pack_any_bits(raw, bits) if bits not in [8, 16] else raw
+            else:
+                indices = data['indices']
+
             # --- OPTIMIZED BITSTREAM UNPACKING ---
             if bits not in [8, 16]:
                 n_elements = 1
