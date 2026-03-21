@@ -1,0 +1,722 @@
+"""
+GPU-Accelerated Huffman + Codebook Kernel
+==========================================
+
+Separate from gpu_accelerated_functions.py so the existing fixed-width
+bit-pack kernel is never touched.
+
+Phase 1 (always available):
+  CPU-side Huffman decode at load time → LCM-packed indices → existing GPU kernel.
+  This delivers the disk/RAM savings without changing the inference hot path.
+
+Phase 2 (GPU kernel):
+  The Huffman-compressed stream lives in VRAM (~18% smaller than LCM-packed).
+  Each forward pass:
+    1. huffman_decode_to_i32_kernel  — decode stream → int32 index buffer
+       (one GPU thread per weight-matrix row, 12-bit LUT in shared memory)
+    2. huffman_i32_linear_kernel     — codebook matmul reading int32 directly
+       (same grid structure as the existing compressed_linear_kernel)
+
+  Note: int32 is used (not uint16) to avoid 16-bit shared-memory issues on
+  ROCm/HIP (AMD GPUs).  The buffer is transient so VRAM impact is minimal.
+
+  VRAM at rest: Huffman stream + codebook (no full index buffer).
+  Peak VRAM during forward: adds one int32[M,K] temp buffer per layer
+  (freed automatically after the forward call returns).
+
+Key difference from DFloat11's fused two-pass kernel:
+  We use the simpler decode-then-matmul approach (two separate kernel launches).
+  This is easier to verify correct and avoids the thread-block prefix-sum
+  synchronisation that DFloat11 requires.  A single-pass fused version
+  (eliminating the temp buffer entirely) can be added as Phase 3 if VRAM
+  headroom is critical.
+
+References:
+  DFloat11 decode.cu — thread-block two-pass Huffman kernel design
+    https://github.com/LeanModels/DFloat11
+  DFloat11 paper: https://arxiv.org/abs/2412.19437
+  Canonical Huffman codes: RFC 1951, §3.2.2
+"""
+
+from __future__ import annotations
+import numpy as np
+import torch
+import torch.nn as nn
+from pathlib import Path
+from typing import Optional, Tuple
+
+from huffman_codebook import huffman_decode_indices
+from bitpack import pack_any_bits
+
+# ---------------------------------------------------------------------------
+# Phase 2 CUDA/HIP kernel source
+# ---------------------------------------------------------------------------
+
+_HUFFMAN_CUDA_SRC = r"""
+// ============================================================================
+// GPU Huffman + Codebook Kernel  (Phase 2)
+// Compatible with NVCC (CUDA) and hipcc (ROCm/HIP via JIT hipification).
+// ============================================================================
+#ifdef __HIP_PLATFORM_AMD__
+    #include <hip/hip_runtime.h>
+    #include <torch/extension.h>
+    #include <stdint.h>
+#else
+    #include <cuda.h>
+    #include <cuda_runtime.h>
+    #include <torch/extension.h>
+    #include <stdint.h>
+#endif
+
+// ── Constants ────────────────────────────────────────────────────────────────
+#define HUFF_LUT_BITS  12
+#define HUFF_LUT_SIZE  (1 << HUFF_LUT_BITS)   // 4096
+#define HUFF_NO_SYM    (-1)   // sentinel in int32 LUT: no valid code at this prefix
+#define DECODE_BLK     64     // threads per block for decode kernel
+
+// NOTE: We use int32_t throughout to avoid sub-32-bit memory access issues
+// on some GPU/driver combinations (known to affect ROCm/HIP JIT compilation).
+// Specifically: uint8_t and uint16_t global-memory reads have been observed to
+// return 0 on gfx906 (MI50/MI60) with ROCm 6.x JIT hipification.
+// All reads therefore use 32-bit or 64-bit access with manual byte extraction.
+
+// ── Helper: inline 32-bit bswap (make big-endian from little-endian word) ────
+__device__ __forceinline__ uint32_t bswap32(uint32_t v) {
+    return ((v & 0xFF000000u) >> 24)
+         | ((v & 0x00FF0000u) >>  8)
+         | ((v & 0x0000FF00u) <<  8)
+         | ((v & 0x000000FFu) << 24);
+}
+
+// ── Helper: read n bits at bit-position p in an MSB-first bitstream ──────────
+// The Huffman stream is MSB-first: bit 0 of the stream = MSB of byte 0.
+// stream_i32 is the raw uint8 stream reinterpreted as int32 (little-endian).
+// Requires the stream to be padded to a multiple of 4 bytes with extra zeros.
+// Only 32-bit reads are used (bswap32 reconstructs the big-endian byte order).
+__device__ __forceinline__ uint32_t huff_read_bits(
+    const int32_t* __restrict__ stream_i32,
+    int64_t bit_pos,
+    int n)
+{
+    int64_t byte_pos = bit_pos >> 3;
+    int     bit_off  = (int)(bit_pos & 7);
+    int64_t word_pos = byte_pos >> 2;           // which 32-bit word
+    int     byte_off = (int)(byte_pos & 3);     // byte offset within that word
+
+    // Read two consecutive 32-bit words, bswap to get MSB-first byte order
+    uint32_t s0 = bswap32((uint32_t)stream_i32[word_pos]);
+    uint32_t s1 = bswap32((uint32_t)stream_i32[word_pos + 1]);
+
+    // Combine to get a 4-byte window starting at byte_off
+    uint32_t w = (byte_off == 0)
+               ? s0
+               : ((s0 << (byte_off * 8)) | (s1 >> ((4 - byte_off) * 8)));
+
+    // The n desired bits start at bit_off from the MSB; shift and mask.
+    return (w >> (32 - bit_off - n)) & ((1u << n) - 1u);
+}
+
+// ── Huffman stream → int32 index buffer ──────────────────────────────────────
+// Grid : ceil(M / DECODE_BLK)
+// Block: DECODE_BLK threads
+// Each thread decodes one row (K symbols) of the [M, K] weight matrix.
+// LUT reads go through global memory (L2 cached) — the 16 KB LUT fits in L2
+// after the first block's accesses.  Shared memory is intentionally avoided:
+// cooperative load of 4096 int32 entries showed unreliable results on
+// ROCm/HIP (the root cause is likely a JIT hipification issue with the
+// cooperative load pattern; bypassing shared memory gives correct results).
+// All parameters use 32-bit or 64-bit types (uint8/uint16 reads return 0 on
+// some ROCm/JIT setups; stream is read via bswap32 from int32* words).
+__global__ void huffman_decode_to_i32_kernel(
+    const int32_t*  __restrict__ huff_stream,    // [ceil(N_B/4)+1] stream as int32 words
+    const int64_t*  __restrict__ row_bit_start,  // [M] bit offset for start of row i
+    const int32_t*  __restrict__ lut_sym_g,      // [HUFF_LUT_SIZE] int32 LUT (L2 cached)
+    const int32_t*  __restrict__ lut_len_g,      // [HUFF_LUT_SIZE] code lengths (int32)
+    const int64_t*  __restrict__ sl_first_code,  // [max_len+2] slow-path first codes
+    const int32_t*  __restrict__ sl_base_offset, // [max_len+2] slow-path offsets
+    const int32_t*  __restrict__ sl_sym,         // [num_long_syms] slow-path symbols (int32)
+    int32_t*        __restrict__ out_indices,    // [M * K] output (int32)
+    int M, int K, int max_code_len)
+{
+    int row = (int)blockIdx.x * DECODE_BLK + (int)threadIdx.x;
+    if (row >= M) return;
+
+    int64_t  bit_pos  = row_bit_start[row];
+    int32_t* out_row  = out_indices + (int64_t)row * K;
+
+    for (int k = 0; k < K; k++) {
+
+        // ── Fast path: 12-bit LUT (read from global/L2-cached memory) ────
+        uint32_t key = huff_read_bits(huff_stream, bit_pos, HUFF_LUT_BITS);
+        int32_t  sym = lut_sym_g[key];
+        int32_t  len = lut_len_g[key];   // int32 (was uint8, broken on some ROCm/JIT)
+
+        if (sym != HUFF_NO_SYM) {
+            out_row[k] = sym;
+            bit_pos   += (int64_t)len;
+            continue;
+        }
+
+        // ── Slow path: extend code bit-by-bit for codes > 12 bits ────────
+        // (rare in practice — <1% of symbols for typical LLM distributions)
+        uint32_t code    = key;   // already have HUFF_LUT_BITS bits
+        int32_t  out_sym = 0;     // default on corrupt stream
+        int      out_len = 1;     // default advance (avoid infinite loop)
+
+        for (int L = HUFF_LUT_BITS + 1; L <= max_code_len; L++) {
+            uint32_t nb = huff_read_bits(huff_stream, bit_pos + (int64_t)(L - 1), 1);
+            code = (code << 1) | nb;
+
+            int64_t fc = sl_first_code[L];
+            if (fc >= 0) {
+                int64_t delta = (int64_t)code - fc;
+                if (delta >= 0) {
+                    int32_t base  = sl_base_offset[L];
+                    int32_t count = sl_base_offset[L + 1] - base;
+                    if ((int32_t)delta < count) {
+                        out_sym = sl_sym[base + (int32_t)delta];
+                        out_len = L;
+                        break;
+                    }
+                }
+            }
+        }
+        out_row[k] = out_sym;
+        bit_pos   += (int64_t)out_len;
+    }
+}
+
+// ── int32-indexed codebook linear (no bit-unpacking) ─────────────────────────
+// Grid(T*M), Block(BLOCK)
+// out[tok, ofeat] = Σ_j  x[tok, j] * codebook[ i32_indices[ofeat*K + j] ]
+// Identical structure to compressed_linear_kernel but reads int32 directly.
+template<int BLOCK>
+__global__ void huffman_i32_linear_kernel(
+    const float*   __restrict__ x,           // [T, K]  float32
+    const int32_t* __restrict__ i32_indices, // [M, K]  int32 (codebook indices)
+    const float*   __restrict__ codebook,    // [C]     float32
+    float*         __restrict__ out,         // [T, M]  float32
+    int T, int M, int K, int C)
+{
+    int idx   = (int)blockIdx.x;
+    int tok   = idx / M;
+    int ofeat = idx - tok * M;
+    int tid   = (int)threadIdx.x;
+
+    __shared__ float sh[BLOCK];
+
+    const float*   xt = x           + (int64_t)tok   * K;
+    const int32_t* wt = i32_indices + (int64_t)ofeat * K;
+    float acc = 0.f;
+
+    for (int j = tid; j < K; j += BLOCK) {
+        int32_t ci = wt[j];
+        if (ci < 0 || ci >= C) ci = C - 1;
+        acc += xt[j] * codebook[ci];
+    }
+    sh[tid] = acc;
+    __syncthreads();
+
+    for (int s = BLOCK >> 1; s > 0; s >>= 1) {
+        if (tid < s) sh[tid] += sh[tid + s];
+        __syncthreads();
+    }
+
+    if (tid == 0) out[(int64_t)tok * M + ofeat] = sh[0];
+}
+
+// ── int32-indexed codebook embedding (no bit-unpacking) ──────────────────────
+// Grid(T, ceil(H/BLOCK)), Block(BLOCK)
+// out[tok, h] = codebook[ i32_indices[token_id * H + h] ]
+template<int BLOCK>
+__global__ void huffman_i32_embedding_kernel(
+    const int32_t* __restrict__ token_ids,   // [T]
+    const int32_t* __restrict__ i32_indices, // [vocab, H]  int32
+    const float*   __restrict__ codebook,    // [C]         float32
+    float*         __restrict__ out,         // [T, H]      float32
+    int T, int H, int C)
+{
+    int tok = (int)blockIdx.x;
+    int h   = (int)blockIdx.y * BLOCK + (int)threadIdx.x;
+    if (h >= H) return;
+
+    int32_t token_id = token_ids[tok];
+    int32_t ci       = i32_indices[(int64_t)token_id * H + h];
+    if (ci < 0 || ci >= C) ci = C - 1;
+    out[(int64_t)tok * H + h] = codebook[ci];
+}
+
+// ── Python-facing C++ entry points ───────────────────────────────────────────
+
+torch::Tensor huffman_decode_to_i32(
+    torch::Tensor huff_stream,    // [ceil(N_B/4)+1] int32 (stream bytes packed as words)
+    torch::Tensor row_bit_start,  // [M]       int64
+    torch::Tensor lut_sym,        // [LUT_SIZE] int32
+    torch::Tensor lut_len,        // [LUT_SIZE] int32  (was uint8; byte reads broken on ROCm/JIT)
+    torch::Tensor sl_first_code,  // [max+2]   int64
+    torch::Tensor sl_base_offset, // [max+2]   int32
+    torch::Tensor sl_sym,         // [N]       int32
+    int64_t M, int64_t K, int64_t max_code_len)
+{
+    huff_stream    = huff_stream.contiguous();
+    row_bit_start  = row_bit_start.contiguous();
+    lut_sym        = lut_sym.contiguous();
+    lut_len        = lut_len.contiguous();
+    sl_first_code  = sl_first_code.contiguous();
+    sl_base_offset = sl_base_offset.contiguous();
+    sl_sym         = sl_sym.contiguous();
+
+    // Allocate int32 output tensor
+    auto out = torch::empty(
+        {M * K},
+        torch::TensorOptions().dtype(torch::kInt32).device(huff_stream.device()));
+
+    const int BLOCK = DECODE_BLK;
+    dim3 grid((unsigned)((M + BLOCK - 1) / BLOCK));
+    dim3 blk(BLOCK);
+
+    huffman_decode_to_i32_kernel<<<grid, blk>>>(
+        huff_stream.data_ptr<int32_t>(),
+        row_bit_start.data_ptr<int64_t>(),
+        lut_sym.data_ptr<int32_t>(),
+        lut_len.data_ptr<int32_t>(),
+        sl_first_code.data_ptr<int64_t>(),
+        sl_base_offset.data_ptr<int32_t>(),
+        sl_sym.data_ptr<int32_t>(),
+        out.data_ptr<int32_t>(),
+        (int)M, (int)K, (int)max_code_len);
+
+    return out;  // int32 tensor of decoded codebook indices
+}
+
+torch::Tensor huffman_i32_linear(
+    torch::Tensor x,            // [*, K]      any float
+    torch::Tensor i32_indices,  // [M * K]     int32
+    torch::Tensor codebook,     // [C]         float32
+    int64_t M, int64_t K)
+{
+    auto orig = x.sizes().vec();
+    int T = (int)(x.numel() / K);
+    int C = (int)codebook.size(0);
+
+    x           = x.reshape({T, K}).to(torch::kFloat32).contiguous();
+    i32_indices = i32_indices.reshape({M, K}).contiguous();
+    codebook    = codebook.to(torch::kFloat32).contiguous();
+
+    auto out = torch::zeros(
+        {T, M},
+        torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
+
+    const int BLOCK = 256;
+    dim3 grid((unsigned)(T * M));
+    dim3 blk(BLOCK);
+
+    huffman_i32_linear_kernel<BLOCK><<<grid, blk>>>(
+        x.data_ptr<float>(),
+        i32_indices.data_ptr<int32_t>(),
+        codebook.data_ptr<float>(),
+        out.data_ptr<float>(),
+        T, (int)M, (int)K, C);
+
+    std::vector<int64_t> out_sz(orig.begin(), orig.end() - 1);
+    out_sz.push_back(M);
+    return out.reshape(out_sz);
+}
+
+torch::Tensor huffman_i32_embedding(
+    torch::Tensor token_ids,    // [*]       int64 or int32
+    torch::Tensor i32_indices,  // [vocab*H] int32
+    torch::Tensor codebook,     // [C]       float32
+    int64_t vocab, int64_t hidden)
+{
+    auto orig = token_ids.sizes().vec();
+    int T = (int)token_ids.numel();
+    int H = (int)hidden;
+    int C = (int)codebook.size(0);
+
+    auto ids = token_ids.reshape({T}).to(torch::kInt32).contiguous();
+    i32_indices = i32_indices.reshape({vocab, H}).contiguous();
+    codebook    = codebook.to(torch::kFloat32).contiguous();
+
+    auto out = torch::zeros(
+        {T, H},
+        torch::TensorOptions().dtype(torch::kFloat32).device(codebook.device()));
+
+    const int BLOCK = 128;
+    dim3 grid((unsigned)T, (unsigned)((H + BLOCK - 1) / BLOCK));
+    dim3 blk(BLOCK);
+
+    huffman_i32_embedding_kernel<BLOCK><<<grid, blk>>>(
+        ids.data_ptr<int32_t>(),
+        i32_indices.data_ptr<int32_t>(),
+        codebook.data_ptr<float>(),
+        out.data_ptr<float>(),
+        T, H, C);
+
+    std::vector<int64_t> out_sz(orig.begin(), orig.end());
+    out_sz.push_back(H);
+    return out.reshape(out_sz);
+}
+"""
+
+_HUFFMAN_CPP_SRC = r"""
+torch::Tensor huffman_decode_to_i32(
+    torch::Tensor huff_stream,
+    torch::Tensor row_bit_start,
+    torch::Tensor lut_sym,
+    torch::Tensor lut_len,
+    torch::Tensor sl_first_code,
+    torch::Tensor sl_base_offset,
+    torch::Tensor sl_sym,
+    int64_t M, int64_t K, int64_t max_code_len);
+
+torch::Tensor huffman_i32_linear(
+    torch::Tensor x,
+    torch::Tensor i32_indices,
+    torch::Tensor codebook,
+    int64_t M, int64_t K);
+
+torch::Tensor huffman_i32_embedding(
+    torch::Tensor token_ids,
+    torch::Tensor i32_indices,
+    torch::Tensor codebook,
+    int64_t vocab, int64_t hidden);
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("huffman_decode_to_i32", &huffman_decode_to_i32,
+          "GPU Huffman decode: stream → int32 index buffer");
+    m.def("huffman_i32_linear",    &huffman_i32_linear,
+          "Codebook linear using int32 indices (no bit-unpacking)");
+    m.def("huffman_i32_embedding", &huffman_i32_embedding,
+          "Codebook embedding using int32 indices (no bit-unpacking)");
+}
+"""
+
+# ---------------------------------------------------------------------------
+# Extension loader
+# ---------------------------------------------------------------------------
+
+_huff_ext = None
+
+
+def _load_huffman_extension():
+    """JIT-compile the GPU Huffman kernels (first call only; cached thereafter)."""
+    global _huff_ext
+    if _huff_ext is not None:
+        return _huff_ext
+    if not torch.cuda.is_available():
+        return None
+
+    try:
+        from torch.utils.cpp_extension import load_inline
+        import re as _re, subprocess as _sub, os as _os
+
+        is_rocm = hasattr(torch.version, 'hip') and torch.version.hip is not None
+        if is_rocm:
+            extra_flags = ["-O3", "-D__HIP_PLATFORM_AMD__=1", "-DUSE_ROCM=1", "-fno-gpu-rdc"]
+        else:
+            extra_flags = ["-O3", "--use_fast_math"]
+
+        print("  [huffman_kernel] Compiling GPU Huffman kernel (first run ~30-60s)...",
+              flush=True)
+        _huff_ext = load_inline(
+            name="huffman_codebook_v4",
+            cpp_sources=[_HUFFMAN_CPP_SRC],
+            cuda_sources=[_HUFFMAN_CUDA_SRC],
+            verbose=False,
+            extra_cuda_cflags=extra_flags,
+        )
+        print("  [huffman_kernel] GPU Huffman kernel ready.", flush=True)
+    except Exception as e:
+        print(f"  [huffman_kernel] Compile failed ({e}); using Phase 1 CPU decode.")
+        _huff_ext = None
+
+    return _huff_ext
+
+
+def _has_phase2_data(data: dict) -> bool:
+    """True if all Phase 2 GPU tables were stored in this NPZ."""
+    return all(k in data for k in (
+        'huff_row_bit_starts', 'huff_lut_sym', 'huff_lut_len',
+        'huff_sl_first_code', 'huff_sl_base_offset', 'huff_sl_sym',
+    ))
+
+
+def _np_to_i32_tensor(arr: np.ndarray, device) -> torch.Tensor:
+    """Upload a numpy array to GPU as int32."""
+    return torch.from_numpy(np.asarray(arr, dtype=np.int32)).to(device)
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 & 2 wrapper classes
+# ---------------------------------------------------------------------------
+
+class HuffmanCodebookLinear:
+    """
+    Linear layer using a Huffman-encoded index stream.
+
+    Phase 1 (CPU decode at load time):
+      Decodes Huffman → LCM-packed → uploads to GPU → reuses existing kernel.
+      VRAM: same as standard LCM-packed (no VRAM savings; disk/RAM savings only).
+
+    Phase 2 (GPU decode per forward pass):
+      Uploads the Huffman stream to GPU VRAM (~18% smaller than LCM-packed).
+      Each forward call decodes to a transient uint16 buffer, then does the matmul.
+      VRAM at rest: ~18% smaller than Phase 1.
+
+    Phase 2 is used when:
+      (a) CUDA is available,
+      (b) the Phase 2 GPU tables were stored at compression time, and
+      (c) the GPU Huffman kernel compiles successfully.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        huff_stream: np.ndarray,
+        huff_lengths: np.ndarray,
+        huff_n: int,
+        codebook: torch.Tensor,
+        shape: Tuple[int, int],
+        bits: int,
+        # Phase 2 data — present when compressed with --entropy-code and shape provided
+        huff_row_bit_starts: Optional[np.ndarray] = None,
+        huff_lut_sym:        Optional[np.ndarray] = None,
+        huff_lut_len:        Optional[np.ndarray] = None,
+        huff_sl_first_code:  Optional[np.ndarray] = None,
+        huff_sl_base_offset: Optional[np.ndarray] = None,
+        huff_sl_sym:         Optional[np.ndarray] = None,
+    ):
+        self.name  = name
+        self.shape = tuple(int(s) for s in shape)
+        self.bits  = bits
+        M, K = self.shape
+
+        phase2_data = all(x is not None for x in (
+            huff_row_bit_starts, huff_lut_sym, huff_lut_len,
+            huff_sl_first_code, huff_sl_base_offset, huff_sl_sym,
+        ))
+
+        if torch.cuda.is_available() and phase2_data:
+            ext = _load_huffman_extension()
+        else:
+            ext = None
+
+        if ext is not None:
+            # ── Phase 2: store Huffman stream on GPU; decode per forward pass ──
+            device = codebook.device if codebook.is_cuda else torch.device('cuda')
+
+            # Pack stream as int32 words (bswap in kernel reconstructs MSB-first order).
+            # Byte-wide global reads return 0 on some ROCm/JIT setups so we use 32-bit.
+            # Pad to multiple of 4 bytes (for int32 view) with enough extra zeros.
+            raw_len = len(huff_stream)  # already has 4 safety bytes from encode
+            pad_len = ((raw_len + 3) // 4) * 4  # round up to multiple of 4
+            padded_u8 = np.zeros(pad_len, dtype=np.uint8)
+            padded_u8[:raw_len] = huff_stream
+            # View as int32: each int32 = 4 consecutive stream bytes (little-endian on host).
+            # The kernel's bswap32() reconstructs the big-endian (MSB-first) word.
+            stream_i32 = padded_u8.view(np.int32)
+
+            self._phase           = 2
+            self._ext             = ext
+            self._huff_stream     = torch.from_numpy(stream_i32.copy()).to(device)
+            self._row_bit_start   = torch.from_numpy(huff_row_bit_starts).to(device)
+            self._lut_sym         = _np_to_i32_tensor(huff_lut_sym, device)
+            self._lut_len         = _np_to_i32_tensor(huff_lut_len, device)
+            self._sl_first_code   = torch.from_numpy(huff_sl_first_code).to(device)
+            self._sl_base_offset  = torch.from_numpy(huff_sl_base_offset).to(device)
+            self._sl_sym          = _np_to_i32_tensor(huff_sl_sym, device)
+            self._max_code_len    = int(huff_lengths.max()) if huff_lengths.max() > 0 else 1
+            self._codebook        = codebook.to(device=device, dtype=torch.float32)
+            self._gpu             = None
+
+            n_stream = len(huff_stream)
+            n_lcm    = (M * K * bits + 7) // 8
+            pct      = (1.0 - n_stream / n_lcm) * 100 if n_lcm else 0.0
+            print(
+                f"  [HuffmanLinear P2] {name}: "
+                f"stream={n_stream/1e3:.1f}KB  LCM={n_lcm/1e3:.1f}KB  "
+                f"VRAM saved={pct:.1f}%",
+                flush=True,
+            )
+
+        elif torch.cuda.is_available():
+            # ── Phase 1: CPU decode → LCM-packed → existing GPU kernel ──
+            self._phase = 1
+            self._ext   = None
+            print(
+                f"  [HuffmanLinear P1] decoding {name}: "
+                f"{huff_n:,} symbols → {bits}-bit",
+                flush=True,
+            )
+            raw_indices = huffman_decode_indices(huff_stream, huff_lengths, huff_n)
+            packed = pack_any_bits(raw_indices, bits)
+            from gpu_accelerated_functions import GPUAcceleratedLinear
+            self._gpu = GPUAcceleratedLinear(name, packed, codebook, shape, bits)
+
+        else:
+            # ── CPU fallback ──
+            self._phase = 0
+            self._ext   = None
+            self._gpu   = None
+            raw_indices = huffman_decode_indices(huff_stream, huff_lengths, huff_n)
+            self._packed_cpu   = pack_any_bits(raw_indices, bits)
+            self._codebook_cpu = codebook
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        in_dtype = x.dtype
+
+        if self._phase == 2:
+            M, K = self.shape
+            device = self._codebook.device
+            # Decode Huffman stream → transient int32 index buffer
+            i32_buf = self._ext.huffman_decode_to_i32(
+                self._huff_stream,
+                self._row_bit_start,
+                self._lut_sym,
+                self._lut_len,
+                self._sl_first_code,
+                self._sl_base_offset,
+                self._sl_sym,
+                M, K, self._max_code_len,
+            )
+            # Codebook matmul using int32 indices
+            out = self._ext.huffman_i32_linear(
+                x.to(device), i32_buf, self._codebook, M, K
+            )
+            return out.to(dtype=in_dtype)
+
+        if self._phase == 1:
+            return self._gpu(x)
+
+        # CPU fallback
+        M, K = self.shape
+        from compressed_matmul_cpu import compressed_matmul as _c_matmul
+        x_np  = x.cpu().reshape(-1, K).float().numpy()
+        cb_np = self._codebook_cpu.cpu().float().numpy()
+        out_np = _c_matmul(x_np, self._packed_cpu, cb_np, M, K, self.bits, C=len(cb_np))
+        return torch.from_numpy(out_np).reshape(*x.shape[:-1], M).to(x.device)
+
+
+class HuffmanCodebookEmbedding:
+    """
+    Embedding layer using a Huffman-encoded index stream.
+
+    Phase 1: CPU decode at load time → existing GPU embedding kernel.
+    Phase 2: GPU decode per forward pass (stream in VRAM, decode → uint16 → lookup).
+    """
+
+    def __init__(
+        self,
+        name: str,
+        huff_stream: np.ndarray,
+        huff_lengths: np.ndarray,
+        huff_n: int,
+        codebook: torch.Tensor,
+        shape: Tuple[int, int],
+        bits: int,
+        huff_row_bit_starts: Optional[np.ndarray] = None,
+        huff_lut_sym:        Optional[np.ndarray] = None,
+        huff_lut_len:        Optional[np.ndarray] = None,
+        huff_sl_first_code:  Optional[np.ndarray] = None,
+        huff_sl_base_offset: Optional[np.ndarray] = None,
+        huff_sl_sym:         Optional[np.ndarray] = None,
+    ):
+        self.name  = name
+        self.shape = tuple(int(s) for s in shape)
+        self.bits  = bits
+        vocab, hidden = self.shape
+
+        phase2_data = all(x is not None for x in (
+            huff_row_bit_starts, huff_lut_sym, huff_lut_len,
+            huff_sl_first_code, huff_sl_base_offset, huff_sl_sym,
+        ))
+
+        if torch.cuda.is_available() and phase2_data:
+            ext = _load_huffman_extension()
+        else:
+            ext = None
+
+        if ext is not None:
+            device = codebook.device if codebook.is_cuda else torch.device('cuda')
+            raw_len = len(huff_stream)
+            pad_len = ((raw_len + 3) // 4) * 4
+            padded_u8 = np.zeros(pad_len, dtype=np.uint8)
+            padded_u8[:raw_len] = huff_stream
+            stream_i32 = padded_u8.view(np.int32)
+
+            self._phase           = 2
+            self._ext             = ext
+            self._huff_stream     = torch.from_numpy(stream_i32.copy()).to(device)
+            self._row_bit_start   = torch.from_numpy(huff_row_bit_starts).to(device)
+            self._lut_sym         = _np_to_i32_tensor(huff_lut_sym, device)
+            self._lut_len         = _np_to_i32_tensor(huff_lut_len, device)
+            self._sl_first_code   = torch.from_numpy(huff_sl_first_code).to(device)
+            self._sl_base_offset  = torch.from_numpy(huff_sl_base_offset).to(device)
+            self._sl_sym          = _np_to_i32_tensor(huff_sl_sym, device)
+            self._max_code_len    = int(huff_lengths.max()) if huff_lengths.max() > 0 else 1
+            self._codebook        = codebook.to(device=device, dtype=torch.float32)
+            self._gpu             = None
+
+            print(f"  [HuffmanEmbed P2] {name}: {huff_n:,} symbols → {bits}-bit", flush=True)
+
+        elif torch.cuda.is_available():
+            self._phase = 1
+            self._ext   = None
+            print(f"  [HuffmanEmbed P1] decoding {name}: {huff_n:,} symbols → {bits}-bit",
+                  flush=True)
+            raw_indices = huffman_decode_indices(huff_stream, huff_lengths, huff_n)
+            packed = pack_any_bits(raw_indices, bits)
+            from gpu_accelerated_functions import GPUAcceleratedEmbedding
+            self._gpu = GPUAcceleratedEmbedding(name, packed, codebook, shape, bits)
+
+        else:
+            self._phase = 0
+            self._ext   = None
+            self._gpu   = None
+            raw_indices = huffman_decode_indices(huff_stream, huff_lengths, huff_n)
+            self._packed_cpu   = pack_any_bits(raw_indices, bits)
+            self._codebook_cpu = codebook
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        if self._phase == 2:
+            vocab, hidden = self.shape
+            device = self._codebook.device
+            # Decode: treat embedding as [vocab, hidden] — row per vocab entry
+            i32_buf = self._ext.huffman_decode_to_i32(
+                self._huff_stream,
+                self._row_bit_start,
+                self._lut_sym,
+                self._lut_len,
+                self._sl_first_code,
+                self._sl_base_offset,
+                self._sl_sym,
+                vocab, hidden, self._max_code_len,
+            )
+            out = self._ext.huffman_i32_embedding(
+                x.to(device), i32_buf, self._codebook, vocab, hidden
+            )
+            return out
+
+        if self._phase == 1:
+            return self._gpu(x)
+
+        # CPU fallback via fast index manager
+        from fast_index_manager import get_index_manager
+        hidden = self.shape[1]
+        cb_cpu = self._codebook_cpu.cpu()
+        index_manager = get_index_manager('cpu')
+        if self.name not in index_manager.lookup_tables:
+            index_manager.prepare_lookup_table(
+                self.name,
+                torch.from_numpy(self._packed_cpu),
+                self.bits,
+            )
+        unique_ids, inverse = torch.unique(x.reshape(-1).cpu(), return_inverse=True)
+        rows = []
+        for tid in unique_ids.tolist():
+            start = int(tid) * hidden
+            row_indices = index_manager.fast_index_lookup(self.name, hidden, start)
+            rows.append(cb_cpu[row_indices.long()])
+        weight = torch.stack(rows, dim=0)
+        return weight[inverse].reshape(*x.shape, hidden).to(x.device)

@@ -46,7 +46,8 @@ def _rss() -> str:
 def _compress_adaptive_worker(name, file_path, offset, size, shape, dtype_str,
                                tensor_name, compression_mode, global_codebooks,
                                mse_threshold=0.0001, native_bits=16, unique_count=None,
-                               target_bits=None):
+                               target_bits=None, entropy_code=False,
+                               huffman_max_params=10_000_000):
     """
     Worker function for multi-tier meta-analysis.
 
@@ -106,6 +107,24 @@ def _compress_adaptive_worker(name, file_path, offset, size, shape, dtype_str,
         del lut, bf16_idx, nonzero
 
         bits = int(np.ceil(np.log2(max(actual_unique, 2))))
+        _n_params = len(indices)
+        if entropy_code and _n_params <= huffman_max_params:
+            _step(f"huffman encoding {_n_params//1_000_000}M indices ({bits}-bit)...")
+            from huffman_codebook import huffman_encode_indices
+            _wshape = tuple(shape) if len(shape) == 2 else None
+            huff = huffman_encode_indices(indices, shape=_wshape)
+            result_data = {
+                'mode': 'direct_codebook', 'encoding': 'huffman',
+                'huff_lengths': huff['huff_lengths'],
+                'huff_stream':  huff['huff_stream'],
+                'huff_n':       huff['huff_n'],
+                'bits': bits, 'codebook': cb_f32, 'shape': shape, 'mse': 0.0,
+            }
+            for key in ('huff_row_bit_starts', 'huff_lut_sym', 'huff_lut_len',
+                        'huff_sl_first_code', 'huff_sl_base_offset', 'huff_sl_sym'):
+                if key in huff:
+                    result_data[key] = huff[key]
+            return name, result_data, f'{bits}-bit (lossless+huffman)', actual_unique, 0.0, 100.0
         if bits not in [8, 16]:
             _step(f"packing {len(indices)//1_000_000}M indices → {bits}-bit...")
             from bitpack import pack_any_bits
@@ -334,10 +353,27 @@ def _compress_adaptive_worker(name, file_path, offset, size, shape, dtype_str,
         del flat  # free before packing if not already freed in lossless branch
 
     if best_strategy and min_bits < 16:
-        from bitpack import pack_any_bits
-        if min_bits not in [8, 16]:
-            _step(f"packing {len(best_strategy['indices'])//1_000_000}M indices → {min_bits}-bit...")
-            best_strategy['indices'] = pack_any_bits(best_strategy['indices'], min_bits)
+        _n_params = len(best_strategy['indices']) if 'indices' in best_strategy else 0
+        if entropy_code and _n_params <= huffman_max_params:
+            raw_idx = best_strategy['indices']
+            _step(f"huffman encoding {len(raw_idx)//1_000_000}M indices ({min_bits}-bit)...")
+            from huffman_codebook import huffman_encode_indices
+            _wshape = tuple(shape) if len(shape) == 2 else None
+            huff = huffman_encode_indices(raw_idx, shape=_wshape)
+            best_strategy['encoding']     = 'huffman'
+            best_strategy['huff_lengths'] = huff['huff_lengths']
+            best_strategy['huff_stream']  = huff['huff_stream']
+            best_strategy['huff_n']       = huff['huff_n']
+            for key in ('huff_row_bit_starts', 'huff_lut_sym', 'huff_lut_len',
+                        'huff_sl_first_code', 'huff_sl_base_offset', 'huff_sl_sym'):
+                if key in huff:
+                    best_strategy[key] = huff[key]
+            del best_strategy['indices']
+        else:
+            from bitpack import pack_any_bits
+            if min_bits not in [8, 16]:
+                _step(f"packing {len(best_strategy['indices'])//1_000_000}M indices → {min_bits}-bit...")
+                best_strategy['indices'] = pack_any_bits(best_strategy['indices'], min_bits)
 
         label = best_strategy.pop('label')
         mse = best_strategy.pop('mse')
@@ -370,7 +406,9 @@ class AdaptiveCompressor(OnTheFlyCompressor):
                  compression_mode: str = 'balanced', sample_size: Optional[int] = None,
                  force_rebuild: bool = False, store_in_model: bool = True,
                  num_workers: Optional[int] = None, mse_threshold: float = 0.005,
-                 target_bits: Optional[int] = None, snr_db: Optional[float] = None):
+                 target_bits: Optional[int] = None, snr_db: Optional[float] = None,
+                 entropy_code: bool = False,
+                 huffman_max_params: int = 10_000_000):
         # Resolve SNR target: explicit --db overrides mode default.
         # Modes are convenience aliases for dB targets; lossless uses absolute MSE.
         if snr_db is not None:
@@ -390,12 +428,19 @@ class AdaptiveCompressor(OnTheFlyCompressor):
             store_in_model=store_in_model,
             snr_threshold_db=snr_threshold_db,
         )
+        # Append -huffman suffix to the auto-computed cache directory so that
+        # Huffman-compressed caches coexist with LCM-packed caches of the same
+        # quality tier (e.g. codebook-30dB/ vs codebook-30dB-huffman/).
+        if entropy_code and cache_dir is None:
+            self.cache_dir = self.cache_dir.parent / (self.cache_dir.name + '-huffman')
         self.snr_threshold_db = snr_threshold_db
         self._snr_values: list = []  # collect per-tensor actual SNR for reporting
         self.sample_size = sample_size
         self.num_workers = num_workers or cpu_count()
         self.mse_threshold = mse_threshold
-        self.target_bits = target_bits  # hard cap for lossy mode; None = use mode default
+        self.target_bits = target_bits   # hard cap for lossy mode; None = use mode default
+        self.entropy_code = entropy_code           # replace LCM bit-packing with Huffman entropy coding
+        self.huffman_max_params = huffman_max_params  # fall back to LCM packing above this size
         self.max_codebook_size = {
             'lossless': 8192,
             'balanced': 4096,   # balanced now searches 8-12 bit adaptively
@@ -979,6 +1024,8 @@ class AdaptiveCompressor(OnTheFlyCompressor):
                     self.mse_threshold, self.native_bits,
                     unique_count=info.get('unique_count'),
                     target_bits=self.target_bits,
+                    entropy_code=self.entropy_code,
+                    huffman_max_params=self.huffman_max_params,
                 )
 
                 safe_name = name_r.replace('.', '_').replace('/', '_')
@@ -993,10 +1040,14 @@ class AdaptiveCompressor(OnTheFlyCompressor):
                     comp_size = result['data'].nbytes
                     bits_str = 'exact'
                 elif result['mode'] == 'direct_codebook':
-                    comp_size = calculate_packed_size(np.prod(result['shape']), bits_used)
+                    if result.get('encoding') == 'huffman':
+                        comp_size = len(result['huff_stream'])
+                        bits_str = f'{bits_used}-bit+huff'
+                    else:
+                        comp_size = calculate_packed_size(np.prod(result['shape']), bits_used)
+                        bits_str = f'{bits_used}-bit'
                     if 'codebook' in result:
                         comp_size += result['codebook'].nbytes
-                    bits_str = f'{bits_used}-bit'
                 elif result['mode'] == 'linear_quant':
                     comp_size = calculate_packed_size(np.prod(result['shape']), bits_used)
                     bits_str = f'{bits_used}-bit (linear)'

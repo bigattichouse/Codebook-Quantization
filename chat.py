@@ -48,6 +48,7 @@ class CompressedChatModel:
         use_mmap: bool = False,
         use_kv_quant: bool = False,
         enable_thinking: bool = False,
+        entropy_code: bool = False,
     ):
         self.model_path = Path(model_path).expanduser()
         self.device = resolve_device(device)
@@ -58,6 +59,7 @@ class CompressedChatModel:
         self.enable_thinking = enable_thinking
         self.use_mmap = use_mmap
         self.use_kv_quant = use_kv_quant
+        self.entropy_code = entropy_code
         self.model = None
         self.tokenizer = None
         self._session_cache = None
@@ -84,10 +86,10 @@ class CompressedChatModel:
 
         # -- Validate cache -----------------------------------------------
         # Build a temporary compressor just to resolve the cache directory
-        # (which now includes the SNR tier, e.g. codebook-30dB/).
+        # (which now includes the SNR tier and optional -huffman suffix).
         _tmp_compressor = AdaptiveCompressor(
             self.model_path, compression_mode=self.compression_mode,
-            store_in_model=True,
+            store_in_model=True, entropy_code=self.entropy_code,
         )
         cache_tensors = _tmp_compressor.cache_dir / 'tensors'
         if not cache_tensors.exists() or not list(cache_tensors.glob('*.npz')):
@@ -543,6 +545,8 @@ def main():
                         help='Store KV cache as INT8 (per-head scale); ~2× less VRAM for long context')
     parser.add_argument('--thinking', action='store_true',
                         help='Enable model chain-of-thought reasoning (Qwen3 thinking mode)')
+    parser.add_argument('--entropy-code', action='store_true',
+                        help='Load from a Huffman-encoded cache (created with compress.py --entropy-code)')
     args = parser.parse_args()
 
     chat_model = CompressedChatModel(
@@ -552,6 +556,7 @@ def main():
         force_rebuild=args.force_rebuild,
         use_kv_quant=args.kv_quant,
         enable_thinking=args.thinking,
+        entropy_code=args.entropy_code,
     )
     if chat_model.load():
         if args.benchmark:

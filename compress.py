@@ -56,6 +56,18 @@ def main():
     parser.add_argument('--bits', type=int, default=None,
                         choices=list(range(4, 14)),
                         help='Hard bit-width cap for lossy mode (4-13, default 8).')
+    parser.add_argument('--entropy-code', action='store_true',
+                        help='Replace LCM bit-packing with Huffman entropy coding.\n'
+                             'Reduces index streams by ~18%% additional compression.\n'
+                             'Load time is slower (CPU Huffman decode); inference speed\n'
+                             'unchanged (expands to fixed-width before GPU upload).\n'
+                             'Codebook stored in a separate subdirectory:\n'
+                             '  codebook-lossless-huffman/, codebook-30dB-huffman/, etc.')
+    parser.add_argument('--huffman-max-params', type=int, default=10_000_000,
+                        help='Tensors larger than this many parameters fall back to\n'
+                             'fixed-width LCM packing (default: 10M).  Increase to\n'
+                             'Huffman-encode the embedding/lm_head at the cost of\n'
+                             'slower model load.  Only relevant with --entropy-code.')
     parser.add_argument('--force', action='store_true',
                         help='Recompress even if cache already exists')
     parser.add_argument('--mse-threshold', type=float, default=None,
@@ -77,12 +89,13 @@ def main():
     target_bits = args.bits
 
     # Determine where the cache will land so we can check for existing data
+    _huff_suffix = '-huffman' if args.entropy_code else ''
     if args.mode == 'lossless':
-        cache_tensors = model_path / 'codebook-lossless' / 'tensors'
+        cache_tensors = model_path / f'codebook-lossless{_huff_suffix}' / 'tensors'
     elif snr_db is not None:
-        cache_tensors = model_path / f'codebook-{int(snr_db)}dB' / 'tensors'
+        cache_tensors = model_path / f'codebook-{int(snr_db)}dB{_huff_suffix}' / 'tensors'
     else:
-        cache_tensors = model_path / 'codebook' / 'tensors'
+        cache_tensors = model_path / f'codebook{_huff_suffix}' / 'tensors'
 
     already_done = cache_tensors.exists() and len(list(cache_tensors.glob('*.npz'))) > 0
 
@@ -95,6 +108,8 @@ def main():
             quality_label += f'  (--mode {args.mode} alias)'
     else:
         quality_label = args.mode
+    if args.entropy_code:
+        quality_label += '  + Huffman entropy coding'
 
     print(f"\n{'='*70}")
     print(f"COMPRESS MODEL")
@@ -129,6 +144,8 @@ def main():
         store_in_model=True,
         force_rebuild=args.force,
         snr_db=snr_db,
+        entropy_code=args.entropy_code,
+        huffman_max_params=args.huffman_max_params,
     )
     if args.mse_threshold is not None:
         kwargs['mse_threshold'] = args.mse_threshold

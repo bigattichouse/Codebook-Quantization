@@ -160,10 +160,20 @@ def _load_cached_tensor(npz_file, tensor_info):
         result['indices'] = data['indices']
     elif mode == 'direct_codebook':
         result['codebook_type'] = str(data['codebook_type'][0])
-        result['indices'] = data['indices']
         result['bits'] = int(data['bits'][0]) if 'bits' in data.files else 8
         if 'codebook' in data.files:
             result['codebook'] = data['codebook']
+        if 'encoding' in data.files and str(data['encoding'][0]) == 'huffman':
+            result['encoding']     = 'huffman'
+            result['huff_lengths'] = data['huff_lengths']
+            result['huff_stream']  = data['huff_stream']
+            result['huff_n']       = data['huff_n']
+            for key in ('huff_row_bit_starts', 'huff_lut_sym', 'huff_lut_len',
+                        'huff_sl_first_code', 'huff_sl_base_offset', 'huff_sl_sym'):
+                if key in data.files:
+                    result[key] = data[key]
+        else:
+            result['indices'] = data['indices']
     elif mode == 'q8_packed_7bit':
         result['packed'] = data['packed']
         result['original_len'] = int(data['original_len'][0])
@@ -202,10 +212,21 @@ def _save_cached_tensor(npz_file, name, data):
         save_dict['indices'] = data['indices']
     elif data['mode'] == 'direct_codebook':
         save_dict['codebook_type'] = np.array([data.get('codebook_type', 'mlp_ffn')])
-        save_dict['indices'] = data['indices']
         save_dict['bits'] = np.array([data.get('bits', 8)])
         if 'codebook' in data:
             save_dict['codebook'] = data['codebook']
+        if data.get('encoding') == 'huffman':
+            save_dict['encoding']      = np.array(['huffman'])
+            save_dict['huff_lengths']  = data['huff_lengths']
+            save_dict['huff_stream']   = data['huff_stream']
+            save_dict['huff_n']        = data['huff_n']
+            # Phase 2 GPU tables (stored when shape is passed to encoder)
+            for key in ('huff_row_bit_starts', 'huff_lut_sym', 'huff_lut_len',
+                        'huff_sl_first_code', 'huff_sl_base_offset', 'huff_sl_sym'):
+                if key in data:
+                    save_dict[key] = data[key]
+        else:
+            save_dict['indices'] = data['indices']
     elif data['mode'] == 'linear_quant':
         save_dict['indices'] = data['indices']
         save_dict['scale'] = np.array([data['scale']])

@@ -21,6 +21,13 @@ except ImportError:
     GPU_ACCELERATED_AVAILABLE = False
     HIP_AVAILABLE = False
 
+# Huffman + codebook kernel (separate file, never modifies the above)
+try:
+    from gpu_huffman_functions import HuffmanCodebookLinear, HuffmanCodebookEmbedding
+    HUFFMAN_AVAILABLE = True
+except ImportError:
+    HUFFMAN_AVAILABLE = False
+
 from fast_index_manager import get_index_manager
 
 try:
@@ -144,7 +151,26 @@ class AdaptiveCodebookLinear(nn.Module):
             # The GPU object stores indices in VRAM; no CPU RAM copy is needed when
             # GPU is active, so we skip register_buffer('indices') in that case.
             gpu_active = False
-            if use_gpu and GPU_ACCELERATED_AVAILABLE and HIP_AVAILABLE and hasattr(layer, 'codebook'):
+
+            # Huffman-encoded path: Phase 2 (GPU decode) or Phase 1 (CPU decode)
+            if data.get('encoding') == 'huffman' and HUFFMAN_AVAILABLE and use_gpu and hasattr(layer, 'codebook'):
+                try:
+                    layer._gpu_func = HuffmanCodebookLinear(
+                        name,
+                        data['huff_stream'], data['huff_lengths'], int(data['huff_n'][0]),
+                        layer.codebook, shape, layer.bits,
+                        huff_row_bit_starts = data.get('huff_row_bit_starts'),
+                        huff_lut_sym        = data.get('huff_lut_sym'),
+                        huff_lut_len        = data.get('huff_lut_len'),
+                        huff_sl_first_code  = data.get('huff_sl_first_code'),
+                        huff_sl_base_offset = data.get('huff_sl_base_offset'),
+                        huff_sl_sym         = data.get('huff_sl_sym'),
+                    )
+                    gpu_active = True
+                except Exception as e:
+                    print(f"Warning: Failed to setup Huffman GPU for {name}: {e}")
+
+            if not gpu_active and use_gpu and GPU_ACCELERATED_AVAILABLE and HIP_AVAILABLE and hasattr(layer, 'codebook'):
                 try:
                     layer._gpu_func = GPUAcceleratedLinear(
                         name, data['indices'], layer.codebook, shape, layer.bits
@@ -166,6 +192,15 @@ class AdaptiveCodebookLinear(nn.Module):
                 else:
                     # .idx file missing — fall back to RAM load
                     layer.register_buffer('indices', torch.from_numpy(data['indices']))
+            elif data.get('encoding') == 'huffman':
+                # CPU fallback: decode Huffman → LCM-packed at load time
+                from huffman_codebook import huffman_decode_indices
+                from bitpack import pack_any_bits
+                raw = huffman_decode_indices(
+                    data['huff_stream'], data['huff_lengths'], int(data['huff_n'][0])
+                )
+                packed = pack_any_bits(raw, layer.bits)
+                layer.register_buffer('indices', torch.from_numpy(packed))
             else:
                 layer.register_buffer('indices', torch.from_numpy(data['indices']))
         elif mode == 'linear_quant':
@@ -263,7 +298,26 @@ class AdaptiveCodebookEmbedding(nn.Module):
 
             # GPU object stores indices in VRAM; no CPU RAM copy needed when GPU active.
             gpu_active = False
-            if use_gpu and GPU_ACCELERATED_AVAILABLE and HIP_AVAILABLE and hasattr(layer, 'codebook'):
+
+            # Huffman path for embedding (Phase 2 or Phase 1)
+            if data.get('encoding') == 'huffman' and HUFFMAN_AVAILABLE and use_gpu and hasattr(layer, 'codebook'):
+                try:
+                    layer._gpu_func = HuffmanCodebookEmbedding(
+                        name,
+                        data['huff_stream'], data['huff_lengths'], int(data['huff_n'][0]),
+                        layer.codebook, shape, layer.bits,
+                        huff_row_bit_starts = data.get('huff_row_bit_starts'),
+                        huff_lut_sym        = data.get('huff_lut_sym'),
+                        huff_lut_len        = data.get('huff_lut_len'),
+                        huff_sl_first_code  = data.get('huff_sl_first_code'),
+                        huff_sl_base_offset = data.get('huff_sl_base_offset'),
+                        huff_sl_sym         = data.get('huff_sl_sym'),
+                    )
+                    gpu_active = True
+                except Exception as e:
+                    print(f"Warning: Failed to setup Huffman GPU for embedding {name}: {e}")
+
+            if not gpu_active and use_gpu and GPU_ACCELERATED_AVAILABLE and HIP_AVAILABLE and hasattr(layer, 'codebook'):
                 try:
                     layer._gpu_func = GPUAcceleratedEmbedding(
                         name, data['indices'], layer.codebook, shape, layer.bits
@@ -283,6 +337,14 @@ class AdaptiveCodebookEmbedding(nn.Module):
                     layer.register_buffer('indices', None)
                 else:
                     layer.register_buffer('indices', torch.from_numpy(data['indices']))
+            elif data.get('encoding') == 'huffman':
+                # CPU fallback: decode at load time
+                from huffman_codebook import huffman_decode_indices
+                from bitpack import pack_any_bits
+                raw = huffman_decode_indices(
+                    data['huff_stream'], data['huff_lengths'], int(data['huff_n'][0])
+                )
+                layer.register_buffer('indices', torch.from_numpy(pack_any_bits(raw, layer.bits)))
             else:
                 layer.register_buffer('indices', torch.from_numpy(data['indices']))
         return layer
