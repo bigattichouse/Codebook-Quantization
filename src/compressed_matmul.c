@@ -102,6 +102,185 @@ raw_embedding_f32(
 }
 
 /* ---------------------------------------------------------------------------
+ * Huffman decode helpers (MSB-first bitstream)
+ * ---------------------------------------------------------------------------
+ *
+ * The Huffman bitstream is MSB-first within each byte:
+ *   bit_pos 0  → byte 0, bit 7 (MSB of first byte)
+ *   bit_pos 7  → byte 0, bit 0 (LSB of first byte)
+ *   bit_pos 8  → byte 1, bit 7
+ *
+ * The stream always has 4 zero-pad bytes appended at encode time, so reading
+ * a 4-byte window starting at any valid bit position is always safe.
+ */
+
+/*
+ * huff_read_bits — peek n bits (n ≤ 25) at absolute bit_pos without advancing.
+ * Returns the bits as the low-order bits of a uint32_t, MSB first.
+ */
+static inline uint32_t
+huff_read_bits(const uint8_t *stream, int64_t bit_pos, int n)
+{
+    int64_t  byte_pos = bit_pos >> 3;
+    int      bit_off  = (int)(bit_pos & 7);  /* bits already consumed in this byte */
+    uint32_t w = ((uint32_t)stream[byte_pos    ] << 24)
+               | ((uint32_t)stream[byte_pos + 1] << 16)
+               | ((uint32_t)stream[byte_pos + 2] <<  8)
+               |  (uint32_t)stream[byte_pos + 3];
+    return (w << bit_off) >> (32 - n);
+}
+
+/*
+ * huff_decode_one — decode one Huffman symbol, advancing *bit_pos.
+ *
+ * Fast path: 12-bit LUT (covers >99% of symbols in practice).
+ *   lut_sym[key] : uint16, codebook symbol (0xFFFF unused since lut_len check comes first)
+ *   lut_len[key] : uint8,  code length (0 = no match → take slow path)
+ *
+ * Slow path: extend bit by bit for codes longer than 12 bits.
+ *   sl_first_code[L]  : int64, first canonical code at length L (-1 = none)
+ *   sl_base_offset[L] : int32, offset into sl_sym[] for length L
+ *   sl_sym[]          : uint16, symbols sorted by (length, code order)
+ *   sl_max_len        : maximum code length in this table
+ */
+#define HUFF_LUT_BITS 12
+
+static inline int
+huff_decode_one(const uint8_t   *stream,
+                int64_t         *bit_pos,
+                const uint16_t  *lut_sym,
+                const uint8_t   *lut_len,
+                const int64_t   *sl_first_code,
+                const int32_t   *sl_base_offset,
+                const uint16_t  *sl_sym,
+                int              sl_max_len)
+{
+    /* --- Fast path: 12-bit LUT --- */
+    uint32_t key = huff_read_bits(stream, *bit_pos, HUFF_LUT_BITS);
+    int      len = (int)lut_len[key];
+    if (len > 0) {
+        *bit_pos += len;
+        return (int)lut_sym[key];
+    }
+
+    /* --- Slow path: extend bit-by-bit beyond 12 bits --- */
+    uint32_t code = key;   /* already have HUFF_LUT_BITS bits */
+    for (int L = HUFF_LUT_BITS + 1; L <= sl_max_len; L++) {
+        uint32_t nb = huff_read_bits(stream, *bit_pos + (int64_t)(L - 1), 1);
+        code = (code << 1) | nb;
+        int64_t fc = sl_first_code[L];
+        if (fc >= 0) {
+            int64_t delta = (int64_t)code - fc;
+            if (delta >= 0) {
+                int32_t cnt = sl_base_offset[L + 1] - sl_base_offset[L];
+                if (delta < (int64_t)cnt) {
+                    *bit_pos += L;
+                    return (int)sl_sym[sl_base_offset[L] + (int)delta];
+                }
+            }
+        }
+    }
+    /* Corrupt stream guard: skip 1 bit and return 0 */
+    *bit_pos += 1;
+    return 0;
+}
+
+/*
+ * huffman_matmul_f32_chunk
+ *
+ * Like compressed_matmul_f32_chunk but weights are stored as a Huffman
+ * bitstream.  Decodes K symbols per row on-the-fly — no unpacked index buffer
+ * is ever created.  Rows are independent → parallelised with OpenMP.
+ *
+ *   x              : (T, K)  float32, row-major
+ *   huff_stream    : uint8[] MSB-first Huffman bitstream (+4 pad bytes at end)
+ *   lut_sym        : uint16[4096] 12-bit LUT symbols
+ *   lut_len        : uint8[4096]  12-bit LUT code lengths (0 = no LUT match)
+ *   sl_first_code  : int64[sl_max_len+2] first canonical code per length > 12
+ *   sl_base_offset : int32[sl_max_len+2] offsets into sl_sym; [max+1] = sentinel
+ *   sl_sym         : uint16[N] slow-path symbols
+ *   row_bit_starts : int64[M]  bit offset of row r in huff_stream
+ *   codebook       : float32[C]
+ *   out            : (T, M)  float32, row-major — caller must zero-initialise
+ *   r_start,r_end  : row range [r_start, r_end)
+ *   sl_max_len     : maximum code length (slow-path loop bound)
+ */
+void
+huffman_matmul_f32_chunk(
+        const float    *x,
+        const uint8_t  *huff_stream,
+        const uint16_t *lut_sym,
+        const uint8_t  *lut_len,
+        const int64_t  *sl_first_code,
+        const int32_t  *sl_base_offset,
+        const uint16_t *sl_sym,
+        const int64_t  *row_bit_starts,
+        const float    *codebook,
+        float          *out,
+        int T, int M, int K, int C,
+        int r_start, int r_end, int sl_max_len)
+{
+    if (r_end > M) r_end = M;
+
+    #pragma omp parallel for schedule(dynamic, 64)
+    for (int r = r_start; r < r_end; r++) {
+        int64_t bit_pos = row_bit_starts[r];
+        for (int k = 0; k < K; k++) {
+            int sym = huff_decode_one(huff_stream, &bit_pos,
+                                      lut_sym, lut_len,
+                                      sl_first_code, sl_base_offset, sl_sym,
+                                      sl_max_len);
+            if (sym >= C) sym = C - 1;
+            float w = codebook[sym];
+            for (int t = 0; t < T; t++)
+                out[t * M + r] += x[t * K + k] * w;
+        }
+    }
+}
+
+/*
+ * huffman_embedding_f32_rows
+ *
+ * Embedding lookup for Huffman-compressed tables.  Decodes H symbols per
+ * token row — only the rows actually requested are decoded, not the full vocab.
+ *
+ *   token_ids      : int32[T]
+ *   (huff fields)  : same layout as huffman_matmul_f32_chunk
+ *   row_bit_starts : int64[vocab]  bit offset for token id t
+ *   out            : (T, H) float32, row-major — overwritten (not accumulated)
+ *   T, H, C        : dimensions
+ */
+void
+huffman_embedding_f32_rows(
+        const int32_t  *token_ids,
+        const uint8_t  *huff_stream,
+        const uint16_t *lut_sym,
+        const uint8_t  *lut_len,
+        const int64_t  *sl_first_code,
+        const int32_t  *sl_base_offset,
+        const uint16_t *sl_sym,
+        const int64_t  *row_bit_starts,
+        const float    *codebook,
+        float          *out,
+        int T, int H, int C, int sl_max_len)
+{
+    #pragma omp parallel for schedule(static)
+    for (int t = 0; t < T; t++) {
+        int32_t tok     = token_ids[t];
+        int64_t bit_pos = row_bit_starts[(int64_t)tok];
+        float  *out_row = out + (int64_t)t * H;
+        for (int h = 0; h < H; h++) {
+            int sym = huff_decode_one(huff_stream, &bit_pos,
+                                      lut_sym, lut_len,
+                                      sl_first_code, sl_base_offset, sl_sym,
+                                      sl_max_len);
+            if (sym >= C) sym = C - 1;
+            out_row[h] = codebook[sym];
+        }
+    }
+}
+
+/* ---------------------------------------------------------------------------
  * Bit unpacking helpers
  * ------------------------------------------------------------------------- */
 

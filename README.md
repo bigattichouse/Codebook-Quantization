@@ -121,14 +121,15 @@ Tested on Quadro P2200 (5 GB VRAM, CUDA 12.2), Qwen3-1.7B, lossless mode:
 
 ### Compression ratio (Qwen3.5-9B, lossless)
 
-| Stage                    | Size    | vs BF16  |
-|--------------------------|---------|----------|
-| Original BF16            | 19.3 GB | —        |
-| Codebook only            | ~15.7 GB | 1.23× (19% smaller) |
-| Codebook + Huffman (disk)| ~9.5 GB  | ~2.0× (51% smaller) |
+| Stage                     | Disk     | RAM (inference) | vs BF16  |
+|---------------------------|----------|-----------------|----------|
+| Original BF16             | 19.3 GB  | 19.3 GB         | —        |
+| Codebook only             | ~15.7 GB | ~15.7 GB        | 1.23×    |
+| Codebook + Huffman        | ~9.5 GB  | ~9.5 GB         | ~2.0×    |
 
-The Huffman stream is decoded once at load time; in-RAM size during inference
-matches the codebook-only figure (~15.7 GB).  Disk/download savings are ~2×.
+With `--entropy-code` the Huffman bitstream stays compressed in RAM throughout
+inference — each matmul row is decoded on-the-fly, so both disk and RAM are ~2×
+smaller than BF16 with no accuracy loss.
 
 ### Layer-level correctness (Qwen3-1.7B, lossless)
 
@@ -217,10 +218,11 @@ INFERENCE_RECOVERY_PLAN.md — diagnostic phases, root-cause taxonomy, fix log
 - **Speed**: on-the-fly codebook lookup adds ~2.3× overhead vs native bf16 matmul
   on GPU.  CPU mode is ~52× slower and intended for correctness testing only.
 - **Compression time**: offline compression is slow (~60 min for 1.7B, CPU-only).
-- **Huffman RAM**: `--entropy-code` reduces on-disk size ~2× but currently the
-  Huffman stream is decoded back to packed-bit indices at load time, so in-RAM
-  size during inference equals the non-Huffman codebook size.  Inference-time
-  Huffman decode (keeping the stream compressed in RAM throughout) is planned.
+- **Huffman RAM**: `--entropy-code` reduces both on-disk size and in-RAM size
+  during inference (~40% smaller than fixed-width packed indices).  The Huffman
+  bitstream stays compressed in RAM; each matmul row is decoded on-the-fly using
+  a 12-bit LUT (one cache-friendly lookup per weight symbol).  Requires gcc
+  (the C/OpenMP kernel); falls back to decode-at-load if gcc is unavailable.
 - **Thinking mode**: Qwen3 models generate a `<think>` block by default, adding
   many tokens before the visible response.  Thinking is disabled by default;
   pass `--thinking` to enable it.

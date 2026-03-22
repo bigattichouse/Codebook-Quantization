@@ -355,6 +355,461 @@ class TestHuffmanLayerForward:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 6b. Inference-time Huffman: bitstream stays compressed in RAM during forward
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _make_huff_data(w_bf16, shape):
+    """Build a complete huff_data dict for a BF16 weight matrix."""
+    from huffman_codebook import huffman_encode_indices
+    M, K = shape
+    uniq = np.unique(w_bf16)
+    lut  = {v: i for i, v in enumerate(uniq)}
+    indices = np.array([lut[v] for v in w_bf16.ravel()], dtype=np.uint16)
+    bits    = int(np.ceil(np.log2(max(len(uniq), 2))))
+    result  = huffman_encode_indices(indices, shape=shape)
+    _lens   = np.asarray(result['huff_lengths'], dtype=np.uint8)
+    sl_max  = int(_lens.max()) if _lens.size and _lens.max() > 0 else 1
+    return uniq, bits, {
+        'huff_stream':    np.asarray(result['huff_stream'],         dtype=np.uint8),
+        'lut_sym':        np.asarray(result['huff_lut_sym'],        dtype=np.uint16),
+        'lut_len':        np.asarray(result['huff_lut_len'],        dtype=np.uint8),
+        'sl_first_code':  np.asarray(result['huff_sl_first_code'],  dtype=np.int64),
+        'sl_base_offset': np.asarray(result['huff_sl_base_offset'], dtype=np.int32),
+        'sl_sym':         np.asarray(result['huff_sl_sym'],         dtype=np.uint16),
+        'row_bit_starts': np.asarray(result['huff_row_bit_starts'], dtype=np.int64),
+        'sl_max_len':     sl_max,
+        # raw fields for from_compressed
+        'huff_lengths':       result['huff_lengths'],
+        'huff_n':             result['huff_n'],
+        'huff_lut_sym':       result['huff_lut_sym'],
+        'huff_lut_len':       result['huff_lut_len'],
+        'huff_sl_first_code': result['huff_sl_first_code'],
+        'huff_sl_base_offset':result['huff_sl_base_offset'],
+        'huff_sl_sym':        result['huff_sl_sym'],
+        'huff_row_bit_starts':result['huff_row_bit_starts'],
+    }
+
+
+class TestHuffmanInferenceMatmul:
+    """huffman_matmul C kernel: correctness, memory property, and edge cases."""
+
+    def _weight(self, M, K, seed=0):
+        rng = np.random.default_rng(seed)
+        w = rng.standard_normal((M, K)).astype(np.float32) * 0.02
+        return _bf16_round_trip(w)
+
+    # ---------------------------------------------------------------- basic
+
+    def test_matches_dense_matmul(self):
+        """huffman_matmul output must equal x @ W.T for a BF16 weight matrix."""
+        from compressed_matmul_cpu import huffman_matmul, C_KERNEL_AVAILABLE
+        if not C_KERNEL_AVAILABLE:
+            pytest.skip("C kernel unavailable")
+        M, K = 64, 128
+        w = self._weight(M, K)
+        codebook, bits, hd = _make_huff_data(w, (M, K))
+        x = np.random.randn(4, K).astype(np.float32)
+        expected = x @ w.T
+        got = huffman_matmul(x, hd, codebook, M, K)
+        np.testing.assert_allclose(got, expected, atol=1e-4,
+                                   err_msg="huffman_matmul diverges from dense")
+
+    def test_single_token(self):
+        """T=1 (autoregressive inference) must work correctly."""
+        from compressed_matmul_cpu import huffman_matmul, C_KERNEL_AVAILABLE
+        if not C_KERNEL_AVAILABLE:
+            pytest.skip("C kernel unavailable")
+        M, K = 32, 64
+        w = self._weight(M, K, seed=7)
+        codebook, bits, hd = _make_huff_data(w, (M, K))
+        x = np.random.randn(1, K).astype(np.float32)
+        expected = x @ w.T
+        got = huffman_matmul(x, hd, codebook, M, K)
+        np.testing.assert_allclose(got, expected, atol=1e-4)
+
+    def test_large_batch(self):
+        """Large batch (T=32) accumulates correctly."""
+        from compressed_matmul_cpu import huffman_matmul, C_KERNEL_AVAILABLE
+        if not C_KERNEL_AVAILABLE:
+            pytest.skip("C kernel unavailable")
+        M, K = 64, 128
+        w = self._weight(M, K, seed=3)
+        codebook, bits, hd = _make_huff_data(w, (M, K))
+        x = np.random.randn(32, K).astype(np.float32)
+        expected = x @ w.T
+        got = huffman_matmul(x, hd, codebook, M, K)
+        np.testing.assert_allclose(got, expected, atol=1e-4)
+
+    def test_no_full_weight_matrix_needed(self):
+        """Huffman stream is smaller than the equivalent packed-bits array."""
+        M, K = 128, 256
+        w = self._weight(M, K, seed=11)
+        codebook, bits, hd = _make_huff_data(w, (M, K))
+        stream_bytes = len(hd['huff_stream'])
+        packed_bytes = (M * K * bits + 7) // 8
+        assert stream_bytes < packed_bytes, \
+            f"Huffman stream ({stream_bytes}B) not smaller than packed ({packed_bytes}B)"
+
+    def test_chunk_rows_consistency(self):
+        """Different chunk_rows values must produce identical results."""
+        from compressed_matmul_cpu import huffman_matmul, C_KERNEL_AVAILABLE
+        if not C_KERNEL_AVAILABLE:
+            pytest.skip("C kernel unavailable")
+        M, K = 128, 64
+        w = self._weight(M, K, seed=5)
+        codebook, bits, hd = _make_huff_data(w, (M, K))
+        x = np.random.randn(4, K).astype(np.float32)
+        ref = huffman_matmul(x, hd, codebook, M, K, chunk_rows=128)
+        for cr in (1, 7, 32, 64):
+            got = huffman_matmul(x, hd, codebook, M, K, chunk_rows=cr)
+            np.testing.assert_allclose(got, ref, atol=1e-6,
+                                       err_msg=f"chunk_rows={cr} diverges")
+
+    def test_3d_input(self):
+        """(B, T, K) input shape must be handled (reshapes internally)."""
+        from compressed_matmul_cpu import huffman_matmul, C_KERNEL_AVAILABLE
+        if not C_KERNEL_AVAILABLE:
+            pytest.skip("C kernel unavailable")
+        M, K = 32, 64
+        w = self._weight(M, K, seed=2)
+        codebook, bits, hd = _make_huff_data(w, (M, K))
+        x_np = np.random.randn(2, 5, K).astype(np.float32)
+        x_2d = np.random.randn(10, K).astype(np.float32)
+        # Use same x values
+        x_2d[:] = x_np.reshape(10, K)
+        got_3d = huffman_matmul(x_np, hd, codebook, M, K)
+        got_2d = huffman_matmul(x_2d, hd, codebook, M, K)
+        np.testing.assert_allclose(
+            got_3d.reshape(10, M), got_2d, atol=1e-6,
+            err_msg="3D vs 2D input shape mismatch"
+        )
+
+
+class TestHuffmanInferenceLinearLayer:
+    """AdaptiveCodebookLinear with _huff_data set stays compressed during inference."""
+
+    def _make_layer(self, M, K, seed=0):
+        from compressed_modules import AdaptiveCodebookLinear
+        rng = np.random.default_rng(seed)
+        w = _bf16_round_trip(rng.standard_normal((M, K)).astype(np.float32) * 0.02)
+        codebook, bits, hd = _make_huff_data(w, (M, K))
+        data = {
+            'mode': 'direct_codebook', 'shape': (M, K), 'bits': bits,
+            'encoding': 'huffman', 'codebook': codebook, 'codebook_type': None,
+            **{k: hd[k] for k in ('huff_stream', 'huff_lengths', 'huff_n',
+                                   'huff_lut_sym', 'huff_lut_len',
+                                   'huff_sl_first_code', 'huff_sl_base_offset',
+                                   'huff_sl_sym', 'huff_row_bit_starts')},
+        }
+        layer = AdaptiveCodebookLinear.from_compressed(
+            f"huff_linear_{M}x{K}_{seed}", data, {}, use_gpu=False
+        )
+        return layer, w
+
+    def test_huff_data_set_not_indices(self):
+        """from_compressed sets _huff_data and leaves indices=None."""
+        from compressed_matmul_cpu import C_KERNEL_AVAILABLE
+        if not C_KERNEL_AVAILABLE:
+            pytest.skip("C kernel unavailable")
+        layer, _ = self._make_layer(32, 64)
+        assert layer._huff_data is not None, "_huff_data not set"
+        assert layer.indices is None, "indices should be None when _huff_data present"
+
+    def test_forward_matches_dense(self):
+        """Layer forward must match F.linear to float32 precision."""
+        from compressed_matmul_cpu import C_KERNEL_AVAILABLE
+        if not C_KERNEL_AVAILABLE:
+            pytest.skip("C kernel unavailable")
+        M, K = 64, 128
+        layer, w_bf16 = self._make_layer(M, K)
+        layer.eval()
+        x = torch.randn(4, K)
+        expected = F.linear(x, torch.from_numpy(w_bf16))
+        got = layer(x)
+        max_err = (expected - got).abs().max().item()
+        assert max_err < 1e-4, f"Linear forward mismatch: {max_err:.6f}"
+
+    def test_forward_no_nan(self):
+        """Forward pass must never produce NaN."""
+        from compressed_matmul_cpu import C_KERNEL_AVAILABLE
+        if not C_KERNEL_AVAILABLE:
+            pytest.skip("C kernel unavailable")
+        layer, _ = self._make_layer(64, 128, seed=42)
+        layer.eval()
+        x = torch.randn(8, 128)
+        out = layer(x)
+        assert not out.isnan().any().item(), "NaN in Huffman linear output"
+
+    def test_forward_with_bias(self):
+        """Bias is correctly added when present."""
+        from compressed_matmul_cpu import C_KERNEL_AVAILABLE
+        if not C_KERNEL_AVAILABLE:
+            pytest.skip("C kernel unavailable")
+        M, K = 32, 64
+        layer, w_bf16 = self._make_layer(M, K, seed=9)
+        bias = torch.randn(M) * 0.1
+        layer.bias = bias
+        layer.eval()
+        x = torch.randn(3, K)
+        expected = F.linear(x, torch.from_numpy(w_bf16), bias)
+        got = layer(x)
+        max_err = (expected - got).abs().max().item()
+        assert max_err < 1e-4, f"Bias mismatch: {max_err:.6f}"
+
+    def test_fallback_when_tables_missing(self):
+        """If Phase-2 tables are absent, falls back to decode-at-load (indices set)."""
+        from compressed_modules import AdaptiveCodebookLinear
+        M, K = 16, 32
+        rng = np.random.default_rng(0)
+        w = _bf16_round_trip(rng.standard_normal((M, K)).astype(np.float32) * 0.02)
+        from huffman_codebook import huffman_encode_indices
+        from bitpack import pack_any_bits
+        uniq = np.unique(w)
+        lut  = {v: i for i, v in enumerate(uniq)}
+        idx  = np.array([lut[v] for v in w.ravel()], dtype=np.uint16)
+        bits = int(np.ceil(np.log2(max(len(uniq), 2))))
+        # Encode without shape → no Phase-2 tables
+        result = huffman_encode_indices(idx)
+        data = {
+            'mode': 'direct_codebook', 'shape': (M, K), 'bits': bits,
+            'encoding': 'huffman', 'codebook': uniq, 'codebook_type': None,
+            'huff_stream':  result['huff_stream'],
+            'huff_lengths': result['huff_lengths'],
+            'huff_n':       result['huff_n'],
+            # No huff_row_bit_starts / huff_lut_sym / etc.
+        }
+        layer = AdaptiveCodebookLinear.from_compressed(
+            "huff_fallback_test", data, {}, use_gpu=False
+        )
+        assert layer._huff_data is None, "_huff_data should be None for fallback"
+        assert layer.indices is not None, "indices should be set for fallback path"
+        layer.eval()
+        x = torch.randn(2, K)
+        out = layer(x)
+        assert not out.isnan().any().item()
+
+
+class TestHuffmanInferenceEmbedding:
+    """AdaptiveCodebookEmbedding with Huffman inference-time decode."""
+
+    def _make_emb_layer(self, vocab, hidden, seed=0):
+        from compressed_modules import AdaptiveCodebookEmbedding
+        rng = np.random.default_rng(seed)
+        w = _bf16_round_trip(rng.standard_normal((vocab, hidden)).astype(np.float32) * 0.02)
+        codebook, bits, hd = _make_huff_data(w, (vocab, hidden))
+        data = {
+            'mode': 'direct_codebook', 'shape': (vocab, hidden), 'bits': bits,
+            'encoding': 'huffman', 'codebook': codebook, 'codebook_type': None,
+            **{k: hd[k] for k in ('huff_stream', 'huff_lengths', 'huff_n',
+                                   'huff_lut_sym', 'huff_lut_len',
+                                   'huff_sl_first_code', 'huff_sl_base_offset',
+                                   'huff_sl_sym', 'huff_row_bit_starts')},
+        }
+        layer = AdaptiveCodebookEmbedding.from_compressed(
+            f"huff_emb_{vocab}x{hidden}_{seed}", data, {}, use_gpu=False
+        )
+        return layer, w
+
+    def test_huff_data_set(self):
+        from compressed_matmul_cpu import C_KERNEL_AVAILABLE
+        if not C_KERNEL_AVAILABLE:
+            pytest.skip("C kernel unavailable")
+        layer, _ = self._make_emb_layer(64, 32)
+        assert layer._huff_data is not None
+        assert layer.indices is None
+
+    def test_forward_matches_dense(self):
+        from compressed_matmul_cpu import C_KERNEL_AVAILABLE
+        if not C_KERNEL_AVAILABLE:
+            pytest.skip("C kernel unavailable")
+        vocab, hidden = 64, 32
+        layer, w_bf16 = self._make_emb_layer(vocab, hidden)
+        layer.eval()
+        ids = torch.tensor([0, 5, 10, 63, 0, 5])
+        expected = F.embedding(ids, torch.from_numpy(w_bf16))
+        got = layer(ids)
+        max_err = (expected - got).abs().max().item()
+        assert max_err < 1e-4, f"Embedding mismatch: {max_err:.6f}"
+
+    def test_forward_no_nan(self):
+        from compressed_matmul_cpu import C_KERNEL_AVAILABLE
+        if not C_KERNEL_AVAILABLE:
+            pytest.skip("C kernel unavailable")
+        layer, _ = self._make_emb_layer(128, 64, seed=7)
+        layer.eval()
+        ids = torch.randint(0, 128, (10,))
+        out = layer(ids)
+        assert not out.isnan().any().item()
+
+    def test_duplicate_tokens_decoded_correctly(self):
+        """Repeated token IDs must all produce the same row."""
+        from compressed_matmul_cpu import C_KERNEL_AVAILABLE
+        if not C_KERNEL_AVAILABLE:
+            pytest.skip("C kernel unavailable")
+        vocab, hidden = 64, 32
+        layer, w_bf16 = self._make_emb_layer(vocab, hidden, seed=3)
+        layer.eval()
+        ids = torch.tensor([7, 7, 7, 7])
+        out = layer(ids)
+        assert out.shape == (4, hidden)
+        # All rows must be identical
+        assert torch.allclose(out[0], out[1]) and torch.allclose(out[0], out[3])
+
+    def test_embed_scale_applied(self):
+        """embed_scale must multiply the Huffman output."""
+        from compressed_matmul_cpu import C_KERNEL_AVAILABLE
+        if not C_KERNEL_AVAILABLE:
+            pytest.skip("C kernel unavailable")
+        vocab, hidden = 32, 16
+        layer, _ = self._make_emb_layer(vocab, hidden)
+        layer.embed_scale = 2.5
+        layer.eval()
+        layer_no_scale, _ = self._make_emb_layer(vocab, hidden)
+        layer_no_scale.eval()
+        ids = torch.tensor([0, 1, 2])
+        scaled   = layer(ids)
+        unscaled = layer_no_scale(ids)
+        np.testing.assert_allclose(
+            scaled.numpy(), unscaled.numpy() * 2.5, atol=1e-5,
+            err_msg="embed_scale not applied in Huffman embedding forward"
+        )
+
+
+class TestHuffmanInferenceEndToEnd:
+    """Tiny LLaMA: Huffman-compressed inference matches uncompressed logits."""
+
+    @pytest.fixture(scope="class")
+    def tiny_huffman_dir(self, tmp_path_factory):
+        """Re-use the same tiny model fixture pattern but compress with --entropy-code."""
+        import subprocess
+        tmp = tmp_path_factory.mktemp("tiny_huff")
+        model_dir = tmp / "tiny_llama_huff"
+        model_dir.mkdir()
+
+        vocab, hidden, layers, intermediate = 256, 64, 2, 128
+        config = {
+            "architectures": ["LlamaForCausalLM"], "model_type": "llama",
+            "hidden_size": hidden, "intermediate_size": intermediate,
+            "num_attention_heads": 4, "num_key_value_heads": 4,
+            "num_hidden_layers": layers, "vocab_size": vocab,
+            "max_position_embeddings": 512, "rms_norm_eps": 1e-5,
+            "rope_theta": 10000.0, "tie_word_embeddings": True,
+            "torch_dtype": "float32",
+        }
+        (model_dir / "config.json").write_text(json.dumps(config))
+        (model_dir / "tokenizer_config.json").write_text(json.dumps({
+            "model_type": "llama", "bos_token": "<s>",
+            "eos_token": "</s>", "unk_token": "<unk>",
+        }))
+        (model_dir / "tokenizer.json").write_text(json.dumps({
+            "version": "1.0",
+            "model": {"type": "BPE", "vocab": {}, "merges": []},
+            "added_tokens": [],
+        }))
+
+        rng = np.random.default_rng(456)
+        tensors = {}
+        def _add(name, shape):
+            w = rng.standard_normal(shape).astype(np.float32) * 0.02
+            u16 = (w.view(np.uint32) >> 16).astype(np.uint16)
+            tensors[name] = u16
+
+        _add("model.embed_tokens.weight", (vocab, hidden))
+        _add("model.norm.weight", (hidden,))
+        for L in range(layers):
+            pfx = f"model.layers.{L}"
+            _add(f"{pfx}.self_attn.q_proj.weight", (hidden, hidden))
+            _add(f"{pfx}.self_attn.k_proj.weight", (hidden, hidden))
+            _add(f"{pfx}.self_attn.v_proj.weight", (hidden, hidden))
+            _add(f"{pfx}.self_attn.o_proj.weight", (hidden, hidden))
+            _add(f"{pfx}.mlp.gate_proj.weight", (intermediate, hidden))
+            _add(f"{pfx}.mlp.up_proj.weight", (intermediate, hidden))
+            _add(f"{pfx}.mlp.down_proj.weight", (hidden, intermediate))
+            _add(f"{pfx}.input_layernorm.weight", (hidden,))
+            _add(f"{pfx}.post_attention_layernorm.weight", (hidden,))
+
+        header = {}; offset = 0; blobs = {}
+        for name, arr in tensors.items():
+            blob = arr.tobytes()
+            header[name] = {"dtype": "BF16", "shape": list(arr.shape),
+                            "data_offsets": [offset, offset + len(blob)]}
+            blobs[name] = blob; offset += len(blob)
+        hdr_bytes = json.dumps(header).encode()
+        with open(model_dir / "model.safetensors", "wb") as f:
+            f.write(struct.pack("<Q", len(hdr_bytes)))
+            f.write(hdr_bytes)
+            for name in tensors:
+                f.write(blobs[name])
+
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "compress.py"), str(model_dir),
+             "--mode", "lossless", "--entropy-code", "--force"],
+            capture_output=True, text=True, cwd=str(ROOT)
+        )
+        assert result.returncode == 0, \
+            f"compress.py --entropy-code failed:\n{result.stderr[-2000:]}"
+        return model_dir
+
+    def _uncompressed_logits(self, model_dir):
+        from transformers import AutoModelForCausalLM
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            m = AutoModelForCausalLM.from_pretrained(
+                str(model_dir), torch_dtype=torch.float32, _fast_init=False
+            )
+        m.eval()
+        ids = torch.tensor([[1, 2, 3, 4, 5]])
+        with torch.no_grad():
+            return m(ids).logits.detach().clone()
+
+    def test_logits_no_nan(self, tiny_huffman_dir):
+        """Huffman inference-time model must not produce NaN logits."""
+        from chat import CompressedChatModel
+        cm = CompressedChatModel(str(tiny_huffman_dir), device='cpu',
+                                 compression_mode='lossless', entropy_code=True)
+        cm.load()
+        cm.model.eval()
+        ids = torch.tensor([[1, 2, 3, 4, 5]])
+        with torch.no_grad():
+            logits = cm.model(ids).logits
+        assert not logits.isnan().any().item(), "NaN in Huffman inference logits"
+
+    def test_logits_match_uncompressed(self, tiny_huffman_dir):
+        """Huffman inference logits must be lossless vs uncompressed (< 1e-3)."""
+        from chat import CompressedChatModel
+        uncompressed = self._uncompressed_logits(tiny_huffman_dir)
+
+        cm = CompressedChatModel(str(tiny_huffman_dir), device='cpu',
+                                 compression_mode='lossless', entropy_code=True)
+        cm.load()
+        cm.model.eval()
+        ids = torch.tensor([[1, 2, 3, 4, 5]])
+        with torch.no_grad():
+            compressed = cm.model(ids).logits.detach()
+
+        max_err = (uncompressed - compressed).abs().max().item()
+        assert max_err < 1e-3, \
+            f"Huffman inference logits diverged: max_err={max_err:.6f}"
+
+    def test_huff_data_set_on_loaded_layers(self, tiny_huffman_dir):
+        """After loading with entropy_code=True, Linear layers must use _huff_data."""
+        from compressed_matmul_cpu import C_KERNEL_AVAILABLE
+        from compressed_modules import AdaptiveCodebookLinear
+        if not C_KERNEL_AVAILABLE:
+            pytest.skip("C kernel unavailable")
+        from chat import CompressedChatModel
+        cm = CompressedChatModel(str(tiny_huffman_dir), device='cpu',
+                                 compression_mode='lossless', entropy_code=True)
+        cm.load()
+        huff_count = sum(
+            1 for m in cm.model.modules()
+            if isinstance(m, AdaptiveCodebookLinear) and m._huff_data is not None
+        )
+        assert huff_count > 0, \
+            "No AdaptiveCodebookLinear layers have _huff_data set after load"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 7. Tiny synthetic model: compress → load → compare logits
 # ─────────────────────────────────────────────────────────────────────────────
 

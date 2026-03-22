@@ -155,6 +155,47 @@ def _build_lib():
         ctypes.c_int,                     # H
     ]
 
+    # huffman_matmul_f32_chunk
+    lib.huffman_matmul_f32_chunk.restype = None
+    lib.huffman_matmul_f32_chunk.argtypes = [
+        ctypes.POINTER(ctypes.c_float),   # x              [T, K]
+        ctypes.POINTER(ctypes.c_uint8),   # huff_stream    uint8[]
+        ctypes.POINTER(ctypes.c_uint16),  # lut_sym        uint16[4096]
+        ctypes.POINTER(ctypes.c_uint8),   # lut_len        uint8[4096]
+        ctypes.POINTER(ctypes.c_int64),   # sl_first_code  int64[max+2]
+        ctypes.POINTER(ctypes.c_int32),   # sl_base_offset int32[max+2]
+        ctypes.POINTER(ctypes.c_uint16),  # sl_sym         uint16[N]
+        ctypes.POINTER(ctypes.c_int64),   # row_bit_starts int64[M]
+        ctypes.POINTER(ctypes.c_float),   # codebook       [C]
+        ctypes.POINTER(ctypes.c_float),   # out            [T, M]
+        ctypes.c_int,                     # T
+        ctypes.c_int,                     # M
+        ctypes.c_int,                     # K
+        ctypes.c_int,                     # C
+        ctypes.c_int,                     # r_start
+        ctypes.c_int,                     # r_end
+        ctypes.c_int,                     # sl_max_len
+    ]
+
+    # huffman_embedding_f32_rows
+    lib.huffman_embedding_f32_rows.restype = None
+    lib.huffman_embedding_f32_rows.argtypes = [
+        ctypes.POINTER(ctypes.c_int),     # token_ids      int32[T]
+        ctypes.POINTER(ctypes.c_uint8),   # huff_stream    uint8[]
+        ctypes.POINTER(ctypes.c_uint16),  # lut_sym        uint16[4096]
+        ctypes.POINTER(ctypes.c_uint8),   # lut_len        uint8[4096]
+        ctypes.POINTER(ctypes.c_int64),   # sl_first_code  int64[max+2]
+        ctypes.POINTER(ctypes.c_int32),   # sl_base_offset int32[max+2]
+        ctypes.POINTER(ctypes.c_uint16),  # sl_sym         uint16[N]
+        ctypes.POINTER(ctypes.c_int64),   # row_bit_starts int64[vocab]
+        ctypes.POINTER(ctypes.c_float),   # codebook       [C]
+        ctypes.POINTER(ctypes.c_float),   # out            [T, H]
+        ctypes.c_int,                     # T
+        ctypes.c_int,                     # H
+        ctypes.c_int,                     # C
+        ctypes.c_int,                     # sl_max_len
+    ]
+
     return lib
 
 
@@ -288,6 +329,14 @@ def _ptr_i32(arr):
     return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
 
 
+def _ptr_u16(arr):
+    return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16))
+
+
+def _ptr_i64(arr):
+    return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int64))
+
+
 def raw_matmul(x_np, weight_np, M, K, chunk_rows=None):
     """
     Compute y = x @ weight.T where weight is a plain float32 matrix.
@@ -357,5 +406,137 @@ def raw_embedding(token_ids_np, weight_np, H):
         lib.raw_embedding_f32(_ptr_i32(ids), _ptr_f32(w_f32), _ptr_f32(out_np), T, H)
     else:
         out_np = w_f32[ids]
+
+    return out_np
+
+
+def _coerce_huff_arrays(huff_data):
+    """Coerce a huff_data dict to the exact dtypes/contiguity required by the C kernel."""
+    stream  = np.ascontiguousarray(huff_data['huff_stream'],    dtype=np.uint8)
+    lut_sym = np.ascontiguousarray(huff_data['lut_sym'],        dtype=np.uint16)
+    lut_len = np.ascontiguousarray(huff_data['lut_len'],        dtype=np.uint8)
+    sl_fc   = np.ascontiguousarray(huff_data['sl_first_code'],  dtype=np.int64)
+    sl_bo   = np.ascontiguousarray(huff_data['sl_base_offset'], dtype=np.int32)
+    sl_sym  = np.ascontiguousarray(huff_data['sl_sym'],         dtype=np.uint16)
+    rbs     = np.ascontiguousarray(huff_data['row_bit_starts'], dtype=np.int64)
+    sl_max  = int(huff_data['sl_max_len'])
+    # Guarantee 4-byte padding at stream end for safe 4-byte window reads
+    stream  = np.concatenate([stream, np.zeros(4, dtype=np.uint8)])
+    return stream, lut_sym, lut_len, sl_fc, sl_bo, sl_sym, rbs, sl_max
+
+
+def huffman_matmul(x_np, huff_data, codebook_np, M, K, chunk_rows=None, C=None):
+    """
+    Compute y = x @ W^T where W is stored as a Huffman bitstream in RAM.
+
+    Decodes K symbols per output row on-the-fly — no packed index buffer is
+    ever created.  In-RAM footprint is the Huffman stream (~60% of packed bits)
+    rather than the full fixed-width index array.
+
+    Args:
+        x_np       : (T, K) float32 numpy array or torch tensor
+        huff_data  : dict with keys huff_stream, lut_sym, lut_len,
+                     sl_first_code, sl_base_offset, sl_sym,
+                     row_bit_starts, sl_max_len
+        codebook_np: (C,) float32
+        M, K       : weight matrix shape
+        chunk_rows : rows per C call (default _CHUNK_ROWS)
+        C          : codebook size (default len(codebook_np))
+
+    Returns:
+        (T, M) float32 numpy array
+    """
+    x_f32  = _as_f32(x_np)
+    cb_f32 = _as_f32(codebook_np)
+
+    orig_shape = x_f32.shape
+    x_f32 = x_f32.reshape(-1, K)
+    T = x_f32.shape[0]
+
+    out_np = np.zeros((T, M), dtype=np.float32)
+    C_size = C if C is not None else len(cb_f32)
+
+    stream, lut_sym, lut_len, sl_fc, sl_bo, sl_sym, rbs, sl_max = \
+        _coerce_huff_arrays(huff_data)
+
+    lib = _get_lib()
+    if not lib:
+        raise RuntimeError(
+            "huffman_matmul requires the C kernel (gcc). "
+            "Huffman inference-time decode is unavailable without gcc."
+        )
+
+    cr = chunk_rows or _CHUNK_ROWS
+    r = 0
+    while r < M:
+        r_end = min(r + cr, M)
+        lib.huffman_matmul_f32_chunk(
+            _ptr_f32(x_f32),
+            _ptr_u8(stream),
+            _ptr_u16(lut_sym),
+            _ptr_u8(lut_len),
+            _ptr_i64(sl_fc),
+            _ptr_i32(sl_bo),
+            _ptr_u16(sl_sym),
+            _ptr_i64(rbs),
+            _ptr_f32(cb_f32),
+            _ptr_f32(out_np),
+            T, M, K, C_size, r, r_end, sl_max
+        )
+        r = r_end
+
+    return out_np.reshape(*orig_shape[:-1], M)
+
+
+def huffman_embedding(token_ids_np, huff_data, codebook_np, H, C=None):
+    """
+    Embedding lookup for a Huffman-compressed weight table.
+
+    Decodes only the rows for the requested token IDs — never decodes the full
+    vocabulary table.
+
+    Args:
+        token_ids_np : (T,) int32/int64 numpy array or torch tensor
+        huff_data    : same dict as huffman_matmul; row_bit_starts is indexed
+                       by token ID and must cover the full vocabulary
+        codebook_np  : (C,) float32
+        H            : embedding / hidden dimension
+        C            : codebook size (default len(codebook_np))
+
+    Returns:
+        (T, H) float32 numpy array
+    """
+    if hasattr(token_ids_np, 'cpu'):
+        ids = np.ascontiguousarray(token_ids_np.cpu().numpy().astype(np.int32))
+    else:
+        ids = np.ascontiguousarray(np.asarray(token_ids_np, dtype=np.int32))
+
+    cb_f32 = _as_f32(codebook_np)
+    T = len(ids)
+    out_np = np.zeros((T, H), dtype=np.float32)
+    C_size = C if C is not None else len(cb_f32)
+
+    stream, lut_sym, lut_len, sl_fc, sl_bo, sl_sym, rbs, sl_max = \
+        _coerce_huff_arrays(huff_data)
+
+    lib = _get_lib()
+    if not lib:
+        raise RuntimeError(
+            "huffman_embedding requires the C kernel (gcc)."
+        )
+
+    lib.huffman_embedding_f32_rows(
+        _ptr_i32(ids),
+        _ptr_u8(stream),
+        _ptr_u16(lut_sym),
+        _ptr_u8(lut_len),
+        _ptr_i64(sl_fc),
+        _ptr_i32(sl_bo),
+        _ptr_u16(sl_sym),
+        _ptr_i64(rbs),
+        _ptr_f32(cb_f32),
+        _ptr_f32(out_np),
+        T, H, C_size, sl_max
+    )
 
     return out_np

@@ -31,9 +31,16 @@ except ImportError:
 from fast_index_manager import get_index_manager
 
 try:
-    from compressed_matmul_cpu import compressed_matmul as _c_matmul, C_KERNEL_AVAILABLE
+    from compressed_matmul_cpu import (
+        compressed_matmul as _c_matmul,
+        huffman_matmul    as _huff_matmul,
+        huffman_embedding as _huff_embedding,
+        C_KERNEL_AVAILABLE,
+    )
 except ImportError:
-    _c_matmul = None
+    _c_matmul      = None
+    _huff_matmul   = None
+    _huff_embedding = None
     C_KERNEL_AVAILABLE = False
 
 class AdaptiveCodebookLinear(nn.Module):
@@ -62,7 +69,8 @@ class AdaptiveCodebookLinear(nn.Module):
         self.bits = 8
         self._gpu_func = None
         self._cached_weight = None
-        self._mmap_buf = None  # MmappedPackedBuffer when use_mmap=True
+        self._mmap_buf = None   # MmappedPackedBuffer when use_mmap=True
+        self._huff_data = None  # dict of numpy arrays for inference-time Huffman decode
 
     def forward(self, x):
         if self.mode == 'exact':
@@ -77,6 +85,26 @@ class AdaptiveCodebookLinear(nn.Module):
             # returns CUDA tensors, which corrupts subsequent CPU operations.
             return self._gpu_func(x).to(x.device)
             
+        if self.mode == 'direct_codebook' and self._huff_data is not None:
+            # Huffman inference-time path: decode K symbols per row on-the-fly.
+            # The Huffman bitstream stays compressed in RAM — no packed index
+            # buffer is ever materialised.  ~40% less RAM than fixed-width path.
+            M, K = self.shape
+            cb_cpu = self.codebook.cpu().float()
+            x_cpu  = x.cpu()
+            orig_shape = x_cpu.shape
+            x_np   = x_cpu.reshape(-1, K).float().numpy()
+
+            out_np = _huff_matmul(x_np, self._huff_data, cb_cpu.numpy(),
+                                  M, K, C=len(cb_cpu))
+
+            out = torch.from_numpy(out_np).reshape(*orig_shape[:-1], M)
+            if self.bias is not None:
+                out = out + self.bias.cpu().float()
+            if x.dtype != torch.float32:
+                out = out.to(x.dtype)
+            return out.to(x.device, non_blocking=True)
+
         if self.mode == 'direct_codebook':
             # True compressed matmul — no weight matrix ever materialised.
             # The C kernel (or numpy fallback) reads packed bits + codebook
@@ -193,14 +221,35 @@ class AdaptiveCodebookLinear(nn.Module):
                     # .idx file missing — fall back to RAM load
                     layer.register_buffer('indices', torch.from_numpy(data['indices']))
             elif data.get('encoding') == 'huffman':
-                # CPU fallback: decode Huffman → LCM-packed at load time
-                from huffman_codebook import huffman_decode_indices
-                from bitpack import pack_any_bits
-                raw = huffman_decode_indices(
-                    data['huff_stream'], data['huff_lengths'], int(data['huff_n'][0])
-                )
-                packed = pack_any_bits(raw, layer.bits)
-                layer.register_buffer('indices', torch.from_numpy(packed))
+                # CPU path: keep Huffman stream in RAM when Phase-2 tables are
+                # available and the C kernel is present — decode on-the-fly
+                # during each forward pass (~40% less RAM than packed indices).
+                if (C_KERNEL_AVAILABLE
+                        and data.get('huff_row_bit_starts') is not None
+                        and data.get('huff_lut_sym') is not None):
+                    _lens = np.asarray(data['huff_lengths'], dtype=np.uint8)
+                    _max  = int(_lens.max()) if _lens.size and _lens.max() > 0 else 1
+                    layer._huff_data = {
+                        'huff_stream':    np.asarray(data['huff_stream'],         dtype=np.uint8),
+                        'lut_sym':        np.asarray(data['huff_lut_sym'],        dtype=np.uint16),
+                        'lut_len':        np.asarray(data['huff_lut_len'],        dtype=np.uint8),
+                        'sl_first_code':  np.asarray(data['huff_sl_first_code'],  dtype=np.int64),
+                        'sl_base_offset': np.asarray(data['huff_sl_base_offset'], dtype=np.int32),
+                        'sl_sym':         np.asarray(data['huff_sl_sym'],         dtype=np.uint16),
+                        'row_bit_starts': np.asarray(data['huff_row_bit_starts'], dtype=np.int64),
+                        'sl_max_len':     _max,
+                    }
+                    layer.register_buffer('indices', None)
+                else:
+                    # Fallback: decode at load time (old behaviour) when Phase-2
+                    # tables are absent or gcc is unavailable.
+                    from huffman_codebook import huffman_decode_indices
+                    from bitpack import pack_any_bits
+                    raw = huffman_decode_indices(
+                        data['huff_stream'], data['huff_lengths'], int(data['huff_n'][0])
+                    )
+                    packed = pack_any_bits(raw, layer.bits)
+                    layer.register_buffer('indices', torch.from_numpy(packed))
             else:
                 layer.register_buffer('indices', torch.from_numpy(data['indices']))
         elif mode == 'linear_quant':
@@ -222,7 +271,8 @@ class AdaptiveCodebookEmbedding(nn.Module):
         self.bits = 8
         self._gpu_func = None
         self._cached_weight = None
-        self._mmap_buf = None  # MmappedPackedBuffer when use_mmap=True
+        self._mmap_buf  = None  # MmappedPackedBuffer when use_mmap=True
+        self._huff_data = None  # dict of numpy arrays for inference-time Huffman decode
         # Some models (e.g. Gemma 3) scale embedding outputs by sqrt(hidden_size)
         # inside the embedding forward.  Preserve that behaviour.
         self.embed_scale: float = 1.0
@@ -240,6 +290,22 @@ class AdaptiveCodebookEmbedding(nn.Module):
             target = self.codebook.dtype if self.codebook is not None else torch.bfloat16
             # x (token IDs) is always on the model device — use it as device reference.
             out = out.to(device=x.device, dtype=target)
+            return out * self.embed_scale if self.embed_scale != 1.0 else out
+
+        if self.mode == 'direct_codebook' and self._huff_data is not None:
+            # Huffman inference-time embedding: decode only the requested token rows
+            # from the compressed bitstream — never decodes the full vocab table.
+            vocab, hidden = self.shape
+            cb_cpu = self.codebook.cpu().float()
+            x_cpu  = x.cpu()
+
+            unique_ids, inverse = torch.unique(x_cpu.reshape(-1), return_inverse=True)
+            ids_np = unique_ids.numpy().astype(np.int32)
+
+            out_unique = _huff_embedding(ids_np, self._huff_data,
+                                         cb_cpu.numpy(), hidden, C=len(cb_cpu))
+            out = torch.from_numpy(out_unique)[inverse].reshape(*x.shape, hidden)
+            out = out.to(x.device)
             return out * self.embed_scale if self.embed_scale != 1.0 else out
 
         if self.mode == 'direct_codebook':
@@ -344,13 +410,29 @@ class AdaptiveCodebookEmbedding(nn.Module):
                 else:
                     layer.register_buffer('indices', torch.from_numpy(data['indices']))
             elif data.get('encoding') == 'huffman':
-                # CPU fallback: decode at load time
-                from huffman_codebook import huffman_decode_indices
-                from bitpack import pack_any_bits
-                raw = huffman_decode_indices(
-                    data['huff_stream'], data['huff_lengths'], int(data['huff_n'][0])
-                )
-                layer.register_buffer('indices', torch.from_numpy(pack_any_bits(raw, layer.bits)))
+                if (C_KERNEL_AVAILABLE
+                        and data.get('huff_row_bit_starts') is not None
+                        and data.get('huff_lut_sym') is not None):
+                    _lens = np.asarray(data['huff_lengths'], dtype=np.uint8)
+                    _max  = int(_lens.max()) if _lens.size and _lens.max() > 0 else 1
+                    layer._huff_data = {
+                        'huff_stream':    np.asarray(data['huff_stream'],         dtype=np.uint8),
+                        'lut_sym':        np.asarray(data['huff_lut_sym'],        dtype=np.uint16),
+                        'lut_len':        np.asarray(data['huff_lut_len'],        dtype=np.uint8),
+                        'sl_first_code':  np.asarray(data['huff_sl_first_code'],  dtype=np.int64),
+                        'sl_base_offset': np.asarray(data['huff_sl_base_offset'], dtype=np.int32),
+                        'sl_sym':         np.asarray(data['huff_sl_sym'],         dtype=np.uint16),
+                        'row_bit_starts': np.asarray(data['huff_row_bit_starts'], dtype=np.int64),
+                        'sl_max_len':     _max,
+                    }
+                    layer.register_buffer('indices', None)
+                else:
+                    from huffman_codebook import huffman_decode_indices
+                    from bitpack import pack_any_bits
+                    raw = huffman_decode_indices(
+                        data['huff_stream'], data['huff_lengths'], int(data['huff_n'][0])
+                    )
+                    layer.register_buffer('indices', torch.from_numpy(pack_any_bits(raw, layer.bits)))
             else:
                 layer.register_buffer('indices', torch.from_numpy(data['indices']))
         return layer
