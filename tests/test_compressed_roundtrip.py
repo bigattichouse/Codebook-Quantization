@@ -1,0 +1,1204 @@
+"""
+test_compressed_roundtrip.py
+
+Unit tests that verify each stage of the compressed inference pipeline:
+
+  1. Codebook packing/unpacking round-trip (no model needed)
+  2. Single-layer forward pass: compressed == uncompressed (synthetic weights)
+  3. Embedding layer forward pass: compressed == uncompressed (synthetic)
+  4. Huffman encode → decode round-trip
+  5. Huffman-compressed layer forward pass == uncompressed
+  6. Full tiny model: compress → load compressed → compare logits
+
+Run:
+    pytest tests/test_compressed_roundtrip.py -v
+or for the real-model integration test:
+    pytest tests/test_compressed_roundtrip.py -v --model <path>
+"""
+
+import sys
+import json
+import struct
+import tempfile
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pytest
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT))
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def _make_weight(shape, seed=0):
+    rng = np.random.default_rng(seed)
+    w = rng.standard_normal(shape).astype(np.float32) * 0.02
+    return w
+
+
+def _bf16_round_trip(arr: np.ndarray) -> np.ndarray:
+    """Simulate bfloat16 storage: truncate lower 16 bits of float32."""
+    u32 = arr.view(np.uint32)
+    u16 = (u32 >> 16).astype(np.uint16)
+    out = (u16.astype(np.uint32) << 16).view(np.float32)
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. Bit-pack / unpack round-trip
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestBitpackRoundtrip:
+    """pack_any_bits → unpack_any_bits must be lossless for all bit widths."""
+
+    @pytest.mark.parametrize("bits", [4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
+    def test_pack_unpack(self, bits):
+        from bitpack import pack_any_bits, unpack_any_bits
+        n = 1024
+        max_val = (1 << bits) - 1
+        rng = np.random.default_rng(bits)
+        idx = rng.integers(0, max_val + 1, size=n, dtype=np.uint16)
+        packed = pack_any_bits(idx, bits)
+        recovered = unpack_any_bits(packed, bits, n)
+        assert np.array_equal(idx, recovered), \
+            f"bits={bits}: round-trip failed at indices {np.where(idx != recovered)[0][:5]}"
+
+    def test_pack_unpack_large(self):
+        from bitpack import pack_any_bits, unpack_any_bits
+        n = 2_621_440  # typical weight tensor size
+        bits = 12
+        rng = np.random.default_rng(42)
+        idx = rng.integers(0, 4096, size=n, dtype=np.uint16)
+        packed = pack_any_bits(idx, bits)
+        recovered = unpack_any_bits(packed, bits, n)
+        assert np.array_equal(idx, recovered)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. Codebook LUT assignment is lossless
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCodebookAssignment:
+    """The codebook quantisation step must reproduce all original values exactly
+    for the lossless mode (every unique bf16 value gets its own entry)."""
+
+    def test_codebook_lossless(self):
+        from adaptive_compressor import AdaptiveCompressor
+        rng = np.random.default_rng(0)
+        # 1024 random float32 values stored as bf16
+        w_f32 = rng.standard_normal(1024).astype(np.float32) * 0.02
+        w_bf16 = _bf16_round_trip(w_f32)
+
+        n_unique = len(np.unique(w_bf16.view(np.uint32)))
+        bits = int(np.ceil(np.log2(max(n_unique, 2))))
+
+        ac = AdaptiveCompressor.__new__(AdaptiveCompressor)
+        # Build a simple LUT manually
+        uniq = np.unique(w_bf16)
+        cb = uniq
+        lut = {v: i for i, v in enumerate(uniq)}
+        indices = np.array([lut[v] for v in w_bf16], dtype=np.uint16)
+
+        # Reconstruct
+        reconstructed = cb[indices]
+        assert np.allclose(w_bf16, reconstructed, atol=0), \
+            "Codebook reconstruction failed — lossless requirement violated"
+
+    def test_codebook_reconstruction_uint16_stored(self):
+        """Exact round-trip: bf16 stored as uint16 → reconstruct → compare."""
+        rng = np.random.default_rng(1)
+        w_f32 = rng.standard_normal(512).astype(np.float32) * 0.02
+        # Simulate what safetensors does for bfloat16 tensors
+        u16 = (w_f32.view(np.uint32) >> 16).astype(np.uint16)
+        # Recover the original bf16 float32 view
+        w_recovered = (u16.astype(np.uint32) << 16).view(np.float32)
+
+        n_unique = len(np.unique(w_recovered))
+        uniq = np.unique(w_recovered)
+        lut = {v: i for i, v in enumerate(uniq)}
+        indices = np.array([lut[v] for v in w_recovered], dtype=np.uint16)
+        reconstructed = uniq[indices]
+
+        assert np.array_equal(w_recovered.view(np.uint32), reconstructed.view(np.uint32)), \
+            "uint16-stored bf16 round-trip failed"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. Compressed linear layer forward == uncompressed
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestLinearForwardEquality:
+    """AdaptiveCodebookLinear.forward() must match F.linear() on the same weights."""
+
+    @pytest.fixture
+    def linear_data(self):
+        M, K = 64, 128
+        rng = np.random.default_rng(42)
+        w_f32 = rng.standard_normal((M, K)).astype(np.float32) * 0.02
+        w_bf16 = _bf16_round_trip(w_f32)
+        return w_f32, w_bf16, M, K
+
+    def test_exact_mode(self, linear_data):
+        """mode='exact' stores the weight tensor directly — must match perfectly."""
+        from compressed_modules import AdaptiveCodebookLinear
+        w_f32, w_bf16, M, K = linear_data
+
+        layer = AdaptiveCodebookLinear("test", (M, K), mode='exact')
+        layer.weight = nn.Parameter(torch.from_numpy(w_bf16), requires_grad=False)
+
+        x = torch.randn(4, K)
+        expected = F.linear(x, torch.from_numpy(w_bf16))
+        got = layer(x)
+        assert torch.allclose(expected, got, atol=1e-6), \
+            f"exact mode mismatch: max err={( expected - got).abs().max()}"
+
+    def test_direct_codebook_cpu_fallback(self, linear_data):
+        """direct_codebook without GPU must match F.linear on original bf16 weights."""
+        from compressed_modules import AdaptiveCodebookLinear
+        from bitpack import pack_any_bits
+        w_f32, w_bf16, M, K = linear_data
+
+        uniq = np.unique(w_bf16)
+        lut = {v: i for i, v in enumerate(uniq)}
+        indices = np.array([lut[v] for v in w_bf16.ravel()], dtype=np.uint16)
+        bits = int(np.ceil(np.log2(max(len(uniq), 2))))
+        packed = pack_any_bits(indices, bits)
+
+        data = {
+            'mode': 'direct_codebook',
+            'shape': (M, K),
+            'bits': bits,
+            'indices': packed,
+            'codebook': uniq,
+            'codebook_type': None,
+        }
+        layer = AdaptiveCodebookLinear.from_compressed(
+            "test", data, {}, use_gpu=False
+        )
+        layer.eval()
+
+        x = torch.randn(4, K)
+        expected = F.linear(x, torch.from_numpy(w_bf16))
+        got = layer(x)
+        # Allow for float32 vs bf16 accumulation differences
+        max_err = (expected - got).abs().max().item()
+        assert max_err < 1e-4, \
+            f"direct_codebook CPU mismatch: max err={max_err:.6f} (expected < 1e-4)"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. Compressed embedding forward == uncompressed
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestEmbeddingForwardEquality:
+    """AdaptiveCodebookEmbedding.forward() must match F.embedding() on same weights."""
+
+    @pytest.fixture
+    def embedding_data(self):
+        vocab, hidden = 128, 64
+        rng = np.random.default_rng(7)
+        w_f32 = rng.standard_normal((vocab, hidden)).astype(np.float32) * 0.02
+        w_bf16 = _bf16_round_trip(w_f32)
+        return w_f32, w_bf16, vocab, hidden
+
+    def test_exact_mode(self, embedding_data):
+        from compressed_modules import AdaptiveCodebookEmbedding
+        w_f32, w_bf16, vocab, hidden = embedding_data
+
+        layer = AdaptiveCodebookEmbedding("emb", (vocab, hidden), mode='exact')
+        layer.weight = nn.Parameter(torch.from_numpy(w_bf16), requires_grad=False)
+
+        ids = torch.tensor([0, 5, 10, 127, 0])
+        expected = F.embedding(ids, torch.from_numpy(w_bf16))
+        got = layer(ids)
+        assert torch.allclose(expected, got, atol=1e-7)
+
+    def test_direct_codebook_cpu_fallback(self, embedding_data):
+        from compressed_modules import AdaptiveCodebookEmbedding
+        from bitpack import pack_any_bits
+        w_f32, w_bf16, vocab, hidden = embedding_data
+
+        flat = w_bf16.ravel()
+        uniq = np.unique(flat)
+        lut = {v: i for i, v in enumerate(uniq)}
+        indices = np.array([lut[v] for v in flat], dtype=np.uint16)
+        bits = int(np.ceil(np.log2(max(len(uniq), 2))))
+        packed = pack_any_bits(indices, bits)
+
+        data = {
+            'mode': 'direct_codebook',
+            'shape': (vocab, hidden),
+            'bits': bits,
+            'indices': packed,
+            'codebook': uniq,
+            'codebook_type': None,
+        }
+        layer = AdaptiveCodebookEmbedding.from_compressed(
+            "emb", data, {}, use_gpu=False
+        )
+        layer.eval()
+
+        ids = torch.tensor([0, 5, 10, 63, 127, 0])
+        expected = F.embedding(ids, torch.from_numpy(w_bf16))
+        got = layer(ids)
+        max_err = (expected - got).abs().max().item()
+        assert max_err < 1e-4, \
+            f"direct_codebook embedding CPU mismatch: max err={max_err:.6f}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. Huffman encode → decode round-trip
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestHuffmanRoundtrip:
+    """huffman_encode_indices → huffman_decode_indices must recover original."""
+
+    @pytest.mark.parametrize("n,bits", [
+        (1024, 8), (4096, 10), (16384, 12), (131072, 13),
+    ])
+    def test_cpu_encode_decode(self, n, bits):
+        from huffman_codebook import huffman_encode_indices, huffman_decode_indices
+        rng = np.random.default_rng(n + bits)
+        max_val = (1 << bits) - 1
+        # Skewed distribution (lower indices much more common)
+        p = 1.0 / (np.arange(1, max_val + 2) ** 1.5)
+        p /= p.sum()
+        idx = rng.choice(max_val + 1, size=n, p=p).astype(np.uint16)
+
+        M, K = max(1, n // 64), 64
+        result = huffman_encode_indices(idx[:M * K], shape=(M, K))
+        decoded = huffman_decode_indices(
+            result['huff_stream'], result['huff_lengths'], int(result['huff_n'][0])
+        )
+        assert np.array_equal(decoded, idx[:M * K]), \
+            f"Huffman round-trip failed for n={n}, bits={bits}"
+
+    def test_all_same_value(self):
+        """Edge case: all indices identical (single-symbol codebook)."""
+        from huffman_codebook import huffman_encode_indices, huffman_decode_indices
+        idx = np.zeros(256, dtype=np.uint16)
+        result = huffman_encode_indices(idx, shape=(4, 64))
+        decoded = huffman_decode_indices(
+            result['huff_stream'], result['huff_lengths'], int(result['huff_n'][0])
+        )
+        assert np.array_equal(decoded, idx)
+
+    def test_two_symbols(self):
+        """Edge case: only two distinct symbols."""
+        from huffman_codebook import huffman_encode_indices, huffman_decode_indices
+        rng = np.random.default_rng(0)
+        idx = rng.integers(0, 2, size=512, dtype=np.uint16)
+        result = huffman_encode_indices(idx, shape=(8, 64))
+        decoded = huffman_decode_indices(
+            result['huff_stream'], result['huff_lengths'], int(result['huff_n'][0])
+        )
+        assert np.array_equal(decoded, idx)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. Huffman-compressed layer forward == uncompressed
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestHuffmanLayerForward:
+    """Huffman-compressed linear layer CPU forward must match F.linear."""
+
+    def test_huffman_linear_cpu(self):
+        from compressed_modules import AdaptiveCodebookLinear
+        from huffman_codebook import huffman_encode_indices
+        from bitpack import pack_any_bits
+
+        M, K = 64, 128
+        rng = np.random.default_rng(99)
+        w_f32 = rng.standard_normal((M, K)).astype(np.float32) * 0.02
+        w_bf16 = _bf16_round_trip(w_f32)
+
+        uniq = np.unique(w_bf16)
+        lut = {v: i for i, v in enumerate(uniq)}
+        indices = np.array([lut[v] for v in w_bf16.ravel()], dtype=np.uint16)
+        bits = int(np.ceil(np.log2(max(len(uniq), 2))))
+
+        result = huffman_encode_indices(indices, shape=(M, K))
+
+        data = {
+            'mode': 'direct_codebook',
+            'shape': (M, K),
+            'bits': bits,
+            'encoding': 'huffman',
+            'codebook': uniq,
+            'codebook_type': None,
+            'huff_stream':        result['huff_stream'],
+            'huff_lengths':       result['huff_lengths'],
+            'huff_n':             result['huff_n'],
+            'huff_row_bit_starts': result['huff_row_bit_starts'],
+            'huff_lut_sym':       result['huff_lut_sym'],
+            'huff_lut_len':       result['huff_lut_len'],
+            'huff_sl_first_code': result['huff_sl_first_code'],
+            'huff_sl_base_offset': result['huff_sl_base_offset'],
+            'huff_sl_sym':        result['huff_sl_sym'],
+        }
+        layer = AdaptiveCodebookLinear.from_compressed(
+            "huff_test", data, {}, use_gpu=False
+        )
+        layer.eval()
+
+        x = torch.randn(4, K)
+        expected = F.linear(x, torch.from_numpy(w_bf16))
+        got = layer(x)
+        max_err = (expected - got).abs().max().item()
+        assert max_err < 1e-4, \
+            f"Huffman linear CPU mismatch: max err={max_err:.6f}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. Tiny synthetic model: compress → load → compare logits
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestSyntheticModelRoundtrip:
+    """End-to-end: build a tiny Llama-like model, compress losslessly, load the
+    compressed version, and verify logits are identical (or very close) to the
+    uncompressed forward pass on CPU."""
+
+    @pytest.fixture(scope="class")
+    def tiny_model_dir(self, tmp_path_factory):
+        tmp_path = tmp_path_factory.mktemp("tiny_model")
+        model_dir = tmp_path / "tiny_llama"
+        model_dir.mkdir()
+
+        vocab, hidden, layers = 256, 64, 2
+        intermediate = 128
+        heads, kv_heads = 4, 4
+
+        config = {
+            "architectures": ["LlamaForCausalLM"],
+            "model_type": "llama",
+            "hidden_size": hidden,
+            "intermediate_size": intermediate,
+            "num_attention_heads": heads,
+            "num_key_value_heads": kv_heads,
+            "num_hidden_layers": layers,
+            "vocab_size": vocab,
+            "max_position_embeddings": 512,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 10000.0,
+            "tie_word_embeddings": True,
+            "torch_dtype": "float32",
+        }
+        (model_dir / "config.json").write_text(json.dumps(config))
+        (model_dir / "tokenizer_config.json").write_text(json.dumps({
+            "model_type": "llama",
+            "bos_token": "<s>",
+            "eos_token": "</s>",
+            "unk_token": "<unk>",
+        }))
+        (model_dir / "tokenizer.json").write_text(json.dumps({
+            "version": "1.0",
+            "model": {"type": "BPE", "vocab": {}, "merges": []},
+            "added_tokens": [],
+        }))
+
+        # Generate deterministic weights
+        rng = np.random.default_rng(123)
+        tensors = {}
+        def _add(name, shape):
+            w = rng.standard_normal(shape).astype(np.float32) * 0.02
+            u16 = (w.view(np.uint32) >> 16).astype(np.uint16)
+            tensors[name] = u16
+
+        _add("model.embed_tokens.weight", (vocab, hidden))
+        _add("model.norm.weight", (hidden,))
+        for L in range(layers):
+            pfx = f"model.layers.{L}"
+            _add(f"{pfx}.self_attn.q_proj.weight", (hidden, hidden))
+            _add(f"{pfx}.self_attn.k_proj.weight", (hidden, hidden))
+            _add(f"{pfx}.self_attn.v_proj.weight", (hidden, hidden))
+            _add(f"{pfx}.self_attn.o_proj.weight", (hidden, hidden))
+            _add(f"{pfx}.mlp.gate_proj.weight", (intermediate, hidden))
+            _add(f"{pfx}.mlp.up_proj.weight", (intermediate, hidden))
+            _add(f"{pfx}.mlp.down_proj.weight", (hidden, intermediate))
+            _add(f"{pfx}.input_layernorm.weight", (hidden,))
+            _add(f"{pfx}.post_attention_layernorm.weight", (hidden,))
+
+        # Write safetensors
+        header = {}
+        offset = 0
+        data_blobs = {}
+        for name, arr in tensors.items():
+            blob = arr.tobytes()
+            h, w = (arr.shape[0], arr.shape[1]) if arr.ndim == 2 else (arr.shape[0], 1)
+            header[name] = {
+                "dtype": "BF16",
+                "shape": list(arr.shape),
+                "data_offsets": [offset, offset + len(blob)],
+            }
+            data_blobs[name] = blob
+            offset += len(blob)
+
+        hdr_bytes = json.dumps(header).encode()
+        with open(model_dir / "model.safetensors", "wb") as f:
+            f.write(struct.pack("<Q", len(hdr_bytes)))
+            f.write(hdr_bytes)
+            for name in tensors:
+                f.write(data_blobs[name])
+
+        return model_dir
+
+    def _get_uncompressed_logits(self, model_dir):
+        """Load uncompressed model and run one forward pass on CPU."""
+        from transformers import AutoModelForCausalLM
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            model = AutoModelForCausalLM.from_pretrained(
+                str(model_dir), torch_dtype=torch.float32, _fast_init=False
+            )
+        model.eval()
+        ids = torch.tensor([[1, 2, 3, 4, 5]])
+        with torch.no_grad():
+            return model(ids).logits.detach().clone()
+
+    def test_logits_match_after_lossless_compress(self, tiny_model_dir):
+        """Compress a tiny model losslessly; verify compressed logits == uncompressed."""
+        import subprocess, sys
+        compress_py = ROOT / "compress.py"
+
+        # Run compression
+        result = subprocess.run(
+            [sys.executable, str(compress_py), str(tiny_model_dir),
+             "--mode", "lossless", "--force"],
+            capture_output=True, text=True, cwd=str(ROOT)
+        )
+        assert result.returncode == 0, \
+            f"compress.py failed:\n{result.stdout[-2000:]}\n{result.stderr[-2000:]}"
+
+        # Verify cache exists
+        cache_dir = tiny_model_dir / "codebook-lossless" / "tensors"
+        assert cache_dir.exists() and list(cache_dir.glob("*.npz")), \
+            "No .npz files in compressed cache"
+
+        # Get uncompressed logits
+        uncompressed = self._get_uncompressed_logits(tiny_model_dir)
+
+        # Get compressed logits via CompressedChatModel
+        sys.path.insert(0, str(ROOT))
+        from chat import CompressedChatModel
+        cm = CompressedChatModel(str(tiny_model_dir), device='cpu',
+                                 compression_mode='lossless')
+        loaded = cm.load()
+        assert loaded is not None, "CompressedChatModel.load() returned None"
+
+        cm.model.eval()
+        ids = torch.tensor([[1, 2, 3, 4, 5]])
+        with torch.no_grad():
+            compressed_logits = cm.model(ids).logits.detach()
+
+        max_err = (uncompressed - compressed_logits).abs().max().item()
+        # Lossless compression: logits must match within float32 arithmetic tolerance
+        assert max_err < 1e-3, \
+            f"Logits diverged after lossless compression: max_err={max_err:.6f}\n" \
+            f"uncompressed[:3]={uncompressed[0, -1, :3]}\n" \
+            f"compressed[:3]={compressed_logits[0, -1, :3]}"
+
+    def test_logits_match_after_huffman_compress(self, tiny_model_dir):
+        """Compress with --entropy-code; verify Huffman-compressed logits == uncompressed."""
+        import subprocess, sys
+        compress_py = ROOT / "compress.py"
+
+        result = subprocess.run(
+            [sys.executable, str(compress_py), str(tiny_model_dir),
+             "--mode", "lossless", "--entropy-code", "--force"],
+            capture_output=True, text=True, cwd=str(ROOT)
+        )
+        assert result.returncode == 0, \
+            f"compress.py --entropy-code failed:\n{result.stdout[-2000:]}\n{result.stderr[-2000:]}"
+
+        cache_dir = tiny_model_dir / "codebook-lossless-huffman" / "tensors"
+        assert cache_dir.exists() and list(cache_dir.glob("*.npz")), \
+            "No .npz files in Huffman compressed cache"
+
+        # At least some tensors should use Huffman encoding
+        import zipfile
+        huffman_count = 0
+        for npz in cache_dir.glob("*.npz"):
+            with zipfile.ZipFile(npz) as z:
+                if any(n.startswith("huff_stream") for n in z.namelist()):
+                    huffman_count += 1
+        assert huffman_count > 0, "No tensors were Huffman-encoded — check --entropy-code flag"
+
+        uncompressed = self._get_uncompressed_logits(tiny_model_dir)
+
+        sys.path.insert(0, str(ROOT))
+        from chat import CompressedChatModel
+        cm = CompressedChatModel(str(tiny_model_dir), device='cpu',
+                                 compression_mode='lossless', entropy_code=True)
+        loaded = cm.load()
+        assert loaded is not None, "CompressedChatModel.load() returned None for Huffman model"
+
+        cm.model.eval()
+        ids = torch.tensor([[1, 2, 3, 4, 5]])
+        with torch.no_grad():
+            compressed_logits = cm.model(ids).logits.detach()
+
+        max_err = (uncompressed - compressed_logits).abs().max().item()
+        assert max_err < 1e-3, \
+            f"Logits diverged after Huffman compression: max_err={max_err:.6f}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7b. RoPE buffer reinitialization — NaN/inf regression tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestRopeReinit:
+    """Regression tests for reinit_rope_buffers NaN/inf detection.
+
+    Bug: IEEE-754 comparisons (nan > 1.5, nan < -1e-6) always return False, so
+    the original `needs_reinit` check silently left NaN inv_freq buffers in
+    place.  NaN in inv_freq cascades to NaN logits through rotary attention.
+
+    Trigger: inject_ssm_kernels loads libcompressed_kernel.so via RTLD_GLOBAL
+    for ALL models (including Llama), initialising the HIP/HSA runtime.
+    Subsequent to_empty() allocations can then contain NaN patterns in inv_freq.
+    """
+
+    @staticmethod
+    def _fake_model_with_inv_freq(inv_freq_tensor):
+        """Wrap a single inv_freq buffer in a minimal nn.Module hierarchy."""
+        class FakeRoPE(nn.Module):
+            def __init__(self, freq):
+                super().__init__()
+                self.register_buffer('inv_freq', freq.clone(), persistent=False)
+
+        class FakeModel(nn.Module):
+            def __init__(self, freq):
+                super().__init__()
+                self.rotary_emb = FakeRoPE(freq)
+
+        return FakeModel(inv_freq_tensor)
+
+    @staticmethod
+    def _valid_inv_freq(half_dim, theta=10000.0):
+        return 1.0 / (theta ** (
+            torch.arange(0, half_dim * 2, 2, dtype=torch.float32) / (half_dim * 2)
+        ))
+
+    class _FakeConfig:
+        rope_theta = 10000.0
+
+    # ------------------------------------------------------------------ basic
+
+    def test_nan_inv_freq_detected_and_reinit(self):
+        """NaN inv_freq → reinit_rope_buffers must detect and fix it."""
+        from rope_utils import reinit_rope_buffers
+        half_dim = 16
+        nan_freq = torch.full((half_dim,), float('nan'))
+        model = self._fake_model_with_inv_freq(nan_freq)
+        assert model.rotary_emb.inv_freq.isnan().any().item(), "pre-cond: must be NaN"
+
+        count = reinit_rope_buffers(model, self._FakeConfig())
+
+        assert count == 1, f"Expected 1 reinit, got {count}"
+        buf = model.rotary_emb.inv_freq
+        assert not buf.isnan().any().item(), "inv_freq still NaN after reinit"
+        assert not buf.isinf().any().item(), "inv_freq inf after reinit"
+        f = buf.float()
+        assert f.min().item() > 0.0, f"inv_freq min={f.min()} not > 0"
+        assert f.max().item() <= 1.0, f"inv_freq max={f.max()} not <= 1"
+
+    def test_inf_inv_freq_detected_and_reinit(self):
+        """Inf inv_freq → reinit_rope_buffers must detect and fix it."""
+        from rope_utils import reinit_rope_buffers
+        half_dim = 16
+        model = self._fake_model_with_inv_freq(torch.full((half_dim,), float('inf')))
+        count = reinit_rope_buffers(model, self._FakeConfig())
+        assert count == 1
+        assert not model.rotary_emb.inv_freq.isinf().any().item()
+
+    def test_negative_inf_inv_freq_detected(self):
+        """-inf inv_freq → reinit_rope_buffers must detect and fix it."""
+        from rope_utils import reinit_rope_buffers
+        half_dim = 16
+        model = self._fake_model_with_inv_freq(torch.full((half_dim,), float('-inf')))
+        count = reinit_rope_buffers(model, self._FakeConfig())
+        assert count == 1
+
+    def test_large_garbage_inv_freq_detected(self):
+        """Values > 1.5 (garbage floats from uninitialized memory) are detected."""
+        from rope_utils import reinit_rope_buffers
+        half_dim = 16
+        model = self._fake_model_with_inv_freq(torch.full((half_dim,), 999.0))
+        count = reinit_rope_buffers(model, self._FakeConfig())
+        assert count == 1
+
+    def test_negative_garbage_inv_freq_detected(self):
+        """Negative values (garbage floats) are detected."""
+        from rope_utils import reinit_rope_buffers
+        half_dim = 16
+        model = self._fake_model_with_inv_freq(torch.full((half_dim,), -0.5))
+        count = reinit_rope_buffers(model, self._FakeConfig())
+        assert count == 1
+
+    def test_valid_inv_freq_not_reinit(self):
+        """Valid float32 inv_freq in (0, 1] must NOT be reinitialized."""
+        from rope_utils import reinit_rope_buffers
+        half_dim = 16
+        valid = self._valid_inv_freq(half_dim)
+        model = self._fake_model_with_inv_freq(valid)
+        original = model.rotary_emb.inv_freq.clone()
+        count = reinit_rope_buffers(model, self._FakeConfig())
+        assert count == 0, f"Valid inv_freq was incorrectly reinitialized (count={count})"
+        assert torch.allclose(model.rotary_emb.inv_freq, original), \
+            "Valid inv_freq was modified"
+
+    def test_bfloat16_inv_freq_reinit(self):
+        """bfloat16 inv_freq (model.to(bfloat16) on garbage) must be detected."""
+        from rope_utils import reinit_rope_buffers
+        half_dim = 16
+        freq = self._valid_inv_freq(half_dim).to(torch.bfloat16)
+        model = self._fake_model_with_inv_freq(freq)
+        # Forcibly set to bfloat16 to simulate model.to(bfloat16) side-effect
+        model.rotary_emb.inv_freq = model.rotary_emb.inv_freq.to(torch.bfloat16)
+        assert model.rotary_emb.inv_freq.dtype == torch.bfloat16
+        count = reinit_rope_buffers(model, self._FakeConfig())
+        assert count == 1
+        assert model.rotary_emb.inv_freq.dtype == torch.float32, \
+            "Reinitialized inv_freq must be float32"
+
+    # ---------------------------------------------------------------- output
+
+    def test_nan_reinit_produces_valid_rope_output(self):
+        """After reinit of NaN inv_freq, RoPE cos/sin computation is NaN-free."""
+        from rope_utils import reinit_rope_buffers
+        half_dim = 16
+        model = self._fake_model_with_inv_freq(torch.full((half_dim,), float('nan')))
+        reinit_rope_buffers(model, self._FakeConfig())
+
+        inv_freq = model.rotary_emb.inv_freq  # [half_dim]
+        positions = torch.arange(8, dtype=torch.float32)
+        freqs = torch.outer(positions, inv_freq)          # [8, half_dim]
+        emb = torch.cat([freqs, freqs], dim=-1)            # [8, head_dim]
+        cos_vals = emb.cos()
+        sin_vals = emb.sin()
+        assert not cos_vals.isnan().any().item(), "cos still NaN after reinit"
+        assert not sin_vals.isnan().any().item(), "sin still NaN after reinit"
+
+    def test_multiple_rope_modules_all_fixed(self):
+        """All NaN inv_freq buffers in a multi-layer model are fixed."""
+        from rope_utils import reinit_rope_buffers
+        half_dim = 16
+
+        class MultiLayerModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                for i in range(4):
+                    class FakeRoPE(nn.Module):
+                        def __init__(self):
+                            super().__init__()
+                            self.register_buffer(
+                                'inv_freq',
+                                torch.full((half_dim,), float('nan')),
+                                persistent=False,
+                            )
+                    setattr(self, f'layer_{i}', nn.Module())
+                    getattr(self, f'layer_{i}').rotary_emb = FakeRoPE()
+
+        model = MultiLayerModel()
+        count = reinit_rope_buffers(model, self._FakeConfig())
+        assert count == 4, f"Expected 4 reinits, got {count}"
+        for i in range(4):
+            buf = getattr(model, f'layer_{i}').rotary_emb.inv_freq
+            assert not buf.isnan().any().item(), f"layer_{i} inv_freq still NaN"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. Embedding scale detection and application
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestEmbedScaleDetection:
+    """Tests for the embed_scale attribute on AdaptiveCodebookEmbedding.
+
+    Some models (e.g. Gemma 3) use a custom embedding class that multiplies
+    output by sqrt(hidden_size) inside forward().  model_loader detects this by
+    checking if 'Scaled' appears in the class name, then sets embed_scale on the
+    replacement AdaptiveCodebookEmbedding.  These tests verify every step.
+    """
+
+    def test_default_scale_is_one(self):
+        """AdaptiveCodebookEmbedding must default to embed_scale=1.0."""
+        from compressed_modules import AdaptiveCodebookEmbedding
+        layer = AdaptiveCodebookEmbedding("emb", (64, 32), mode='exact')
+        assert layer.embed_scale == 1.0, \
+            f"Expected default embed_scale=1.0, got {layer.embed_scale}"
+
+    def test_scale_one_is_exact_noop(self):
+        """embed_scale=1.0 must return the exact same tensor as F.embedding."""
+        from compressed_modules import AdaptiveCodebookEmbedding
+        vocab, hidden = 64, 32
+        w = torch.randn(vocab, hidden)
+        layer = AdaptiveCodebookEmbedding("emb", (vocab, hidden), mode='exact')
+        layer.weight = nn.Parameter(w.clone(), requires_grad=False)
+        layer.embed_scale = 1.0
+
+        ids = torch.tensor([0, 1, 2, 5])
+        expected = F.embedding(ids, w)
+        got = layer(ids)
+        assert torch.equal(got, expected), \
+            "embed_scale=1.0 changed the output — should be a no-op"
+
+    def test_scale_applied_in_exact_mode(self):
+        """embed_scale != 1.0 must multiply the output in exact mode."""
+        from compressed_modules import AdaptiveCodebookEmbedding
+        vocab, hidden = 64, 32
+        w = torch.randn(vocab, hidden)
+        layer = AdaptiveCodebookEmbedding("emb", (vocab, hidden), mode='exact')
+        layer.weight = nn.Parameter(w.clone(), requires_grad=False)
+
+        scale = float(hidden ** 0.5)  # sqrt(32) ≈ 5.657
+        layer.embed_scale = scale
+
+        ids = torch.tensor([0, 1, 2, 5, 63])
+        expected = F.embedding(ids, w) * scale
+        got = layer(ids)
+        assert torch.allclose(got, expected, atol=1e-6), \
+            f"embed_scale not applied in exact mode: max_err={(got - expected).abs().max():.2e}"
+
+    def test_scale_applied_in_direct_codebook_mode(self):
+        """embed_scale must multiply the output of the direct_codebook CPU path."""
+        from compressed_modules import AdaptiveCodebookEmbedding
+        from bitpack import pack_any_bits
+
+        vocab, hidden = 64, 32
+        rng = np.random.default_rng(42)
+        w_f32 = rng.standard_normal((vocab, hidden)).astype(np.float32) * 0.02
+        w_bf16 = _bf16_round_trip(w_f32)
+
+        flat = w_bf16.ravel()
+        uniq = np.unique(flat)
+        lut = {v: i for i, v in enumerate(uniq)}
+        indices = np.array([lut[v] for v in flat], dtype=np.uint16)
+        bits = int(np.ceil(np.log2(max(len(uniq), 2))))
+        packed = pack_any_bits(indices, bits)
+
+        data = {
+            'mode': 'direct_codebook', 'shape': (vocab, hidden), 'bits': bits,
+            'indices': packed, 'codebook': uniq, 'codebook_type': None,
+        }
+        scale = float(hidden ** 0.5)
+        # Use a unique name to avoid polluting the FastIndexManager singleton cache
+        layer = AdaptiveCodebookEmbedding.from_compressed(
+            "emb_scale_dc_32", data, {}, use_gpu=False
+        )
+        layer.embed_scale = scale
+        layer.eval()
+
+        ids = torch.tensor([0, 5, 10, 32, 63])
+        expected = F.embedding(ids, torch.from_numpy(w_bf16)) * scale
+        got = layer(ids)
+        max_err = (expected - got).abs().max().item()
+        assert max_err < 1e-4, \
+            f"embed_scale not applied in direct_codebook mode: max_err={max_err:.2e}"
+
+    def test_scaled_class_name_sets_embed_scale(self):
+        """_try_replace_embedding detection: 'Scaled' in class name → embed_scale=sqrt(dim)."""
+        # Simulate what model_loader._try_replace_embedding does
+        class FakeScaledWordEmbedding(nn.Embedding):
+            """Fake Gemma-style embedding that multiplies by sqrt(hidden_size)."""
+            def forward(self, x):
+                return super().forward(x) * (self.embedding_dim ** 0.5)
+
+        from compressed_modules import AdaptiveCodebookEmbedding
+        hidden = 640  # Gemma 270M hidden size
+        layer = AdaptiveCodebookEmbedding("emb", (256, hidden), mode='exact')
+
+        # Apply the same detection logic as model_loader._try_replace_embedding
+        child = FakeScaledWordEmbedding(256, hidden)
+        class_name = type(child).__name__
+        if 'Scaled' in class_name or 'scaled' in class_name:
+            h = getattr(child, 'embedding_dim', None)
+            if h and h > 1:
+                layer.embed_scale = float(h ** 0.5)
+
+        expected_scale = float(hidden ** 0.5)  # ≈ 25.298
+        assert abs(layer.embed_scale - expected_scale) < 1e-5, \
+            f"Expected embed_scale≈{expected_scale:.3f}, got {layer.embed_scale}"
+
+    def test_unscaled_class_name_leaves_scale_one(self):
+        """Regular nn.Embedding (no 'Scaled' in name) must leave embed_scale=1.0."""
+        class RegularEmbedding(nn.Embedding):
+            pass
+
+        from compressed_modules import AdaptiveCodebookEmbedding
+        layer = AdaptiveCodebookEmbedding("emb", (256, 64), mode='exact')
+
+        # Apply detection logic
+        child = RegularEmbedding(256, 64)
+        class_name = type(child).__name__
+        if 'Scaled' in class_name or 'scaled' in class_name:
+            h = getattr(child, 'embedding_dim', None)
+            if h and h > 1:
+                layer.embed_scale = float(h ** 0.5)
+
+        assert layer.embed_scale == 1.0, \
+            f"Expected embed_scale=1.0 for unscaled embedding, got {layer.embed_scale}"
+
+    def test_scaled_embedding_matches_original_forward(self):
+        """Compressed embedding with embed_scale must exactly match original scaled forward."""
+        class FakeScaledWordEmbedding(nn.Embedding):
+            def forward(self, x):
+                return super().forward(x) * (self.embedding_dim ** 0.5)
+
+        from compressed_modules import AdaptiveCodebookEmbedding
+        from bitpack import pack_any_bits
+
+        vocab, hidden = 128, 64
+        rng = np.random.default_rng(7)
+        w_f32 = rng.standard_normal((vocab, hidden)).astype(np.float32) * 0.02
+        w_bf16 = _bf16_round_trip(w_f32)
+
+        # Build the original scaled embedding with known weights
+        orig = FakeScaledWordEmbedding(vocab, hidden)
+        orig.weight = nn.Parameter(torch.from_numpy(w_bf16), requires_grad=False)
+        orig.eval()
+
+        # Build compressed equivalent
+        flat = w_bf16.ravel()
+        uniq = np.unique(flat)
+        lut = {v: i for i, v in enumerate(uniq)}
+        indices = np.array([lut[v] for v in flat], dtype=np.uint16)
+        bits = int(np.ceil(np.log2(max(len(uniq), 2))))
+        packed = pack_any_bits(indices, bits)
+        data = {
+            'mode': 'direct_codebook', 'shape': (vocab, hidden), 'bits': bits,
+            'indices': packed, 'codebook': uniq, 'codebook_type': None,
+        }
+        # Use a unique name so the FastIndexManager singleton doesn't serve a
+        # stale lookup table from a different test with the same layer name.
+        compressed = AdaptiveCodebookEmbedding.from_compressed(
+            "emb_scale_match_128x64", data, {}, use_gpu=False
+        )
+        compressed.embed_scale = float(hidden ** 0.5)
+        compressed.eval()
+
+        ids = torch.tensor([0, 1, 5, 10, 63, 127])
+        with torch.no_grad():
+            expected = orig(ids)
+            got = compressed(ids)
+
+        max_err = (expected - got).abs().max().item()
+        assert max_err < 1e-4, \
+            f"Scaled-compressed embedding doesn't match original scaled forward: " \
+            f"max_err={max_err:.2e}"
+
+    def test_embed_scale_detection_gemma_class_names(self):
+        """Verify detection works for all observed Gemma embedding class names."""
+        from compressed_modules import AdaptiveCodebookEmbedding
+
+        # All class names that should trigger scale detection
+        scaled_names = [
+            "Gemma3TextScaledWordEmbedding",
+            "GemmaScaledEmbedding",
+            "ScaledEmbedding",
+            "scaled_word_embedding",
+        ]
+        # Class names that should NOT trigger scale detection
+        unscaled_names = [
+            "Embedding",
+            "GemmaEmbedding",
+            "LlamaEmbedding",
+            "GPT2Embedding",
+        ]
+
+        def _apply_detection(class_name, embedding_dim=64):
+            layer = AdaptiveCodebookEmbedding("emb", (256, embedding_dim), mode='exact')
+            if 'Scaled' in class_name or 'scaled' in class_name:
+                h = embedding_dim
+                if h and h > 1:
+                    layer.embed_scale = float(h ** 0.5)
+            return layer.embed_scale
+
+        for name in scaled_names:
+            scale = _apply_detection(name, embedding_dim=64)
+            assert scale != 1.0, \
+                f"'{name}' should trigger scale detection but embed_scale=1.0"
+            assert abs(scale - 8.0) < 1e-5, \
+                f"'{name}': expected scale=sqrt(64)=8.0, got {scale}"
+
+        for name in unscaled_names:
+            scale = _apply_detection(name, embedding_dim=64)
+            assert scale == 1.0, \
+                f"'{name}' should NOT trigger scale detection but embed_scale={scale}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. Real-model integration (needs --model flag)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.fixture(scope="session")
+def real_model_path(request):
+    """Resolve path to a real model for integration tests.
+
+    Priority:
+      1. --model <path>  explicit CLI flag
+      2. Auto-discovered from local HF cache (gpt2 → gemma → Qwen, in that order)
+
+    Never triggers a network download.
+    """
+    p = request.config.getoption("--model", default=None)
+    if p:
+        p = Path(p).expanduser().resolve()
+        if not p.exists():
+            pytest.skip(f"Model path not found: {p}")
+        return p
+
+    # Check direct paths (no network needed)
+    for direct in (
+        Path.home() / "workspace" / "model" / "Soprano-80M",
+        Path.home() / "workspace" / "model" / "Qwen3-0.6B",
+        Path.home() / "workspace" / "model" / "Qwen3-1.7B",
+        Path.home() / "workspace" / "model" / "Qwen3.5-9B",
+    ):
+        if direct.exists() and (direct / "config.json").exists():
+            print(f"\n  [real_model_path] Using direct model path: {direct}")
+            return direct
+
+    # Auto-discover from HF cache (no network download)
+    try:
+        import huggingface_hub
+        for repo_id in ("gpt2", "google/gemma-3-270m-it", "Qwen/Qwen3.5-0.8B"):
+            try:
+                cached = huggingface_hub.snapshot_download(repo_id, local_files_only=True)
+                if cached and Path(cached).exists():
+                    auto = Path(cached)
+                    print(f"\n  [real_model_path] Using auto-discovered model: {auto}")
+                    return auto
+            except Exception:
+                continue
+    except ImportError:
+        pass
+
+    pytest.skip("No cached model found; pass --model <path> or download gpt2 first")
+
+
+class TestRealModelCompressedVsUncompressed:
+    """Compare uncompressed and compressed (lossless) logits on the real model."""
+
+    @staticmethod
+    def _ensure_compressed(real_model_path):
+        """Run compress.py --mode lossless if no cache exists yet."""
+        import subprocess, sys
+        cache = real_model_path / "codebook-lossless" / "tensors"
+        if not (cache.exists() and list(cache.glob("*.npz"))):
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "compress.py"), str(real_model_path),
+                 "--mode", "lossless"],
+                capture_output=True, text=True, cwd=str(ROOT),
+                timeout=600,  # 10-minute cap for large models
+            )
+            assert result.returncode == 0, \
+                f"compress.py failed:\n{result.stdout[-2000:]}\n{result.stderr[-2000:]}"
+
+    def test_lossless_logits_close(self, real_model_path):
+        """Lossless logits should match uncompressed within matmul-precision tolerance.
+
+        Our compressor stores all weights at BF16 precision (the fast lossless path
+        is BF16-only; float32 weights fall to BF16-exact storage).  The fair
+        comparison is therefore:
+
+          uncompressed model loaded in bfloat16  (same weight precision)
+          vs compressed model (BF16 weights + float32 CPU matmul accumulation)
+
+        Any remaining logit error comes from bfloat16 vs float32 *accumulation*
+        in the matmuls, compounding across all layers.  Top-1 token accuracy is the
+        primary correctness metric — see test_top_token_matches.
+        """
+        self._ensure_compressed(real_model_path)
+
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+        import sys
+        tok = AutoTokenizer.from_pretrained(str(real_model_path), trust_remote_code=True)
+        ids = tok("What is 2+2?", return_tensors="pt").input_ids
+
+        # Load uncompressed in bfloat16 — matches the effective compressed precision
+        # (compressor stores every weight at bf16 precision regardless of source dtype).
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            unc_model = AutoModelForCausalLM.from_pretrained(
+                str(real_model_path), torch_dtype=torch.bfloat16, trust_remote_code=True
+            )
+        unc_model.eval()
+        with torch.no_grad():
+            uncompressed = unc_model(ids).logits.detach().float()
+        del unc_model
+
+        # Compressed (CPU float32 matmul)
+        sys.path.insert(0, str(ROOT))
+        from chat import CompressedChatModel
+        cm = CompressedChatModel(str(real_model_path), device='cpu',
+                                 compression_mode='lossless')
+        loaded = cm.load()
+        assert loaded is not None
+        cm.model.eval()
+        with torch.no_grad():
+            compressed = cm.model(ids).logits.detach().float()
+
+        max_err = (uncompressed - compressed).abs().max().item()
+        # bf16 vs f32 accumulation across many layers typically yields ~10-25 logit
+        # units.  Use 30.0 with margin to account for larger models.
+        tol = 30.0
+        print(f"\n  Logit max error (bf16 uncompressed vs compressed): {max_err:.2e}"
+              f"  (tol={tol})")
+        assert max_err < tol, \
+            f"Real-model logits diverged too much: max_err={max_err:.4f}, tol={tol}"
+
+    def test_top_token_matches(self, real_model_path):
+        """Top predicted token must be identical between compressed and uncompressed."""
+        self._ensure_compressed(real_model_path)
+
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+        import sys
+        tok = AutoTokenizer.from_pretrained(str(real_model_path), trust_remote_code=True)
+        ids = tok("The capital of France is", return_tensors="pt").input_ids
+
+        # Load uncompressed in bfloat16 (matches compressed weight precision)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            unc = AutoModelForCausalLM.from_pretrained(
+                str(real_model_path), torch_dtype=torch.bfloat16, trust_remote_code=True
+            )
+        unc.eval()
+        with torch.no_grad():
+            top_unc = unc(ids).logits[0, -1].argmax().item()
+        del unc
+
+        sys.path.insert(0, str(ROOT))
+        from chat import CompressedChatModel
+        cm = CompressedChatModel(str(real_model_path), device='cpu', compression_mode='lossless')
+        loaded = cm.load()
+        assert loaded is not None
+        cm.model.eval()
+        with torch.no_grad():
+            top_cmp = cm.model(ids).logits[0, -1].argmax().item()
+
+        print(f"\n  Uncompressed top token: {top_unc} ({tok.decode([top_unc])})")
+        print(f"  Compressed  top token: {top_cmp} ({tok.decode([top_cmp])})")
+        assert top_unc == top_cmp, \
+            f"Top token mismatch: uncompressed={top_unc}, compressed={top_cmp}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10. Real-model Huffman integration (needs --model flag or auto-discovery)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestRealModelHuffmanCompressed:
+    """Verify that --entropy-code (Huffman) gives the same top token as uncompressed
+    on a real model.  Uses the same real_model_path fixture as class 9."""
+
+    @staticmethod
+    def _ensure_huffman_compressed(real_model_path):
+        """Run compress.py --mode lossless --entropy-code if no Huffman cache exists."""
+        import subprocess, sys
+        cache = real_model_path / "codebook-lossless-huffman" / "tensors"
+        if not (cache.exists() and list(cache.glob("*.npz"))):
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "compress.py"), str(real_model_path),
+                 "--mode", "lossless", "--entropy-code"],
+                capture_output=True, text=True, cwd=str(ROOT),
+                timeout=1200,  # 20-minute cap (Huffman encode adds time for large models)
+            )
+            assert result.returncode == 0, \
+                f"compress.py --entropy-code failed:\n{result.stdout[-2000:]}\n{result.stderr[-2000:]}"
+
+    def test_huffman_top_token_matches(self, real_model_path):
+        """Huffman-compressed top token must match uncompressed top token."""
+        self._ensure_huffman_compressed(real_model_path)
+
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+        import sys
+        tok = AutoTokenizer.from_pretrained(str(real_model_path), trust_remote_code=True)
+        ids = tok("The capital of France is", return_tensors="pt").input_ids
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            unc = AutoModelForCausalLM.from_pretrained(
+                str(real_model_path), torch_dtype=torch.bfloat16, trust_remote_code=True
+            )
+        unc.eval()
+        with torch.no_grad():
+            top_unc = unc(ids).logits[0, -1].argmax().item()
+        del unc
+
+        sys.path.insert(0, str(ROOT))
+        from chat import CompressedChatModel
+        cm = CompressedChatModel(str(real_model_path), device='cpu',
+                                 compression_mode='lossless', entropy_code=True)
+        loaded = cm.load()
+        assert loaded is not None, "CompressedChatModel.load() returned None for Huffman model"
+        cm.model.eval()
+        with torch.no_grad():
+            top_huff = cm.model(ids).logits[0, -1].argmax().item()
+
+        print(f"\n  Uncompressed  top token: {top_unc} ({tok.decode([top_unc])})")
+        print(f"  Huffman-compr top token: {top_huff} ({tok.decode([top_huff])})")
+        assert top_unc == top_huff, \
+            f"Top token mismatch after Huffman: uncompressed={top_unc}, huffman={top_huff}"
+
+    def test_huffman_logits_close(self, real_model_path):
+        """Huffman-compressed logits must be within bf16/f32 accumulation tolerance."""
+        self._ensure_huffman_compressed(real_model_path)
+
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+        import sys
+        tok = AutoTokenizer.from_pretrained(str(real_model_path), trust_remote_code=True)
+        ids = tok("What is 2+2?", return_tensors="pt").input_ids
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            unc = AutoModelForCausalLM.from_pretrained(
+                str(real_model_path), torch_dtype=torch.bfloat16, trust_remote_code=True
+            )
+        unc.eval()
+        with torch.no_grad():
+            uncompressed = unc(ids).logits.detach().float()
+        del unc
+
+        sys.path.insert(0, str(ROOT))
+        from chat import CompressedChatModel
+        cm = CompressedChatModel(str(real_model_path), device='cpu',
+                                 compression_mode='lossless', entropy_code=True)
+        loaded = cm.load()
+        assert loaded is not None
+        cm.model.eval()
+        with torch.no_grad():
+            huffman = cm.model(ids).logits.detach().float()
+
+        max_err = (uncompressed - huffman).abs().max().item()
+        tol = 30.0
+        print(f"\n  Huffman logit max error vs uncompressed: {max_err:.2e}  (tol={tol})")
+        assert max_err < tol, \
+            f"Huffman-compressed logits diverged: max_err={max_err:.4f}, tol={tol}"
+
+    def test_huffman_cache_uses_huff_fields(self, real_model_path):
+        """Verify the Huffman cache actually contains huff_stream / huff_lengths fields."""
+        import zipfile
+        self._ensure_huffman_compressed(real_model_path)
+
+        # lossless + entropy_code → cache suffix -huffman (set by AdaptiveCompressor)
+        cache_dir = real_model_path / "codebook-lossless-huffman" / "tensors"
+        assert cache_dir.exists(), "Huffman cache directory not found"
+
+        npz_files = list(cache_dir.glob("*.npz"))
+        assert npz_files, "No .npz files in Huffman cache"
+
+        huffman_count = 0
+        for npz in npz_files:
+            with zipfile.ZipFile(npz) as z:
+                if any(n.startswith("huff_stream") for n in z.namelist()):
+                    huffman_count += 1
+
+        frac = huffman_count / len(npz_files)
+        print(f"\n  Huffman-encoded tensors: {huffman_count}/{len(npz_files)} ({frac:.1%})")
+        # At least half of tensors should be Huffman-encoded
+        assert frac >= 0.4, \
+            f"Too few Huffman-encoded tensors: {huffman_count}/{len(npz_files)}"

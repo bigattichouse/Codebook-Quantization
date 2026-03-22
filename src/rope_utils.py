@@ -75,6 +75,8 @@ def reinit_rope_buffers(model, config) -> int:
         buf_f32 = buf.detach().float()
         needs_reinit = (
             buf.dtype != torch.float32 or
+            buf_f32.isnan().any().item() or
+            buf_f32.isinf().any().item() or
             buf_f32.max().item() > 1.5 or
             buf_f32.min().item() < -1e-6
         )

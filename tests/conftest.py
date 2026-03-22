@@ -13,6 +13,42 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 
+def _find_default_real_model() -> "Path | None":
+    """Return the path to the best locally-cached real model for integration tests.
+
+    Priority:
+      1. ~/workspace/model/Soprano-80M  (tiny Qwen3, always on this machine)
+      2. gpt2   (HF cache; small, fast)
+      3. google/gemma-3-270m-it  (HF cache; preferred for bf16 lossless tests)
+      4. Qwen/Qwen3.5-0.8B  (HF cache)
+
+    Direct paths are checked before HF cache so we never trigger a network download.
+    Returns None if nothing is found.
+    """
+    # Check direct paths first (no network needed)
+    for direct in (
+        Path.home() / "workspace" / "model" / "Soprano-80M",
+        Path.home() / "workspace" / "model" / "Qwen3-0.6B",
+        Path.home() / "workspace" / "model" / "Qwen3-1.7B",
+        Path.home() / "workspace" / "model" / "Qwen3.5-9B",
+    ):
+        if direct.exists() and (direct / "config.json").exists():
+            return direct
+
+    try:
+        import huggingface_hub
+        for repo_id in ("gpt2", "google/gemma-3-270m-it", "Qwen/Qwen3.5-0.8B"):
+            try:
+                p = huggingface_hub.snapshot_download(repo_id, local_files_only=True)
+                if p and Path(p).exists():
+                    return Path(p)
+            except Exception:
+                continue
+    except ImportError:
+        pass
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Markers & hooks
 # ---------------------------------------------------------------------------
@@ -64,6 +100,28 @@ def cleanup_memory():
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+@pytest.fixture(autouse=True)
+def clear_index_manager_cache():
+    """Clear the FastIndexManager lookup-table cache between tests.
+
+    FastIndexManager is a process-level singleton.  If two tests create an
+    AdaptiveCodebookEmbedding with the *same layer name* but *different data*,
+    the second test will reuse the stale lookup table from the first, producing
+    wrong results.  Clearing the cache after each test prevents this.
+
+    Workaround if you prefer not to rely on this fixture: use a unique layer
+    name in every test (e.g. include the test function name in the layer name).
+    """
+    yield
+    try:
+        from fast_index_manager import get_index_manager
+        mgr = get_index_manager('cpu')
+        if hasattr(mgr, 'lookup_tables'):
+            mgr.lookup_tables.clear()
+    except Exception:
+        pass  # not fatal — import may fail on some setups
 
 
 # ---------------------------------------------------------------------------

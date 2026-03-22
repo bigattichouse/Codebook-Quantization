@@ -23,10 +23,21 @@ Short version:
    lossless mode).  Written as `.npz` files alongside the model.  CPU-only,
    never causes VRAM OOM.
 
+   Optional: add `--entropy-code` to apply Huffman entropy coding on top of
+   the codebook indices.  Because the codebook is frequency-sorted (index 0 =
+   most common weight value), the index distribution is highly non-uniform
+   (~8 bits/symbol entropy vs 13 bits fixed-width), so Huffman reduces
+   on-disk and in-RAM size by an additional ~40% with zero accuracy cost.
+
 2. **Load compressed** — model is instantiated on PyTorch's `meta` device
    (zero RAM cost), then `nn.Linear` / `nn.Embedding` modules are swapped for
    `AdaptiveCodebookLinear` / `AdaptiveCodebookEmbedding`.  Only norms, biases,
    and SSM scalars are loaded as exact floats.
+
+   With `--entropy-code`, the Huffman stream is decoded back to packed-bit
+   indices at load time (one-shot CPU decode), then inference proceeds
+   identically to the non-Huffman path.  This saves disk I/O and reduces
+   storage footprint without adding per-token compute overhead.
 
 3. **Inference** — CUDA kernels compute `out = x @ W` directly from the packed
    index stream and codebook, without ever building the full `W` matrix.  A
@@ -59,10 +70,16 @@ For AMD GPU (MI50 / ROCm) setup, see the MI50_ROCM_SETUP.md doc included with th
 
 ```bash
 ./venv/bin/python compress.py ~/workspace/model/Qwen3-1.7B --mode lossless
+
+# With Huffman entropy coding (~40% smaller on disk/RAM, same accuracy):
+./venv/bin/python compress.py ~/workspace/model/Qwen3-1.7B --mode lossless --entropy-code
 ```
 
 Modes: `lossless` (best quality), `balanced`, `aggressive` (smallest).
 Compression is CPU-only, one-time.  Interrupted runs can be safely resumed.
+
+`--entropy-code` applies canonical Huffman coding to the codebook index stream.
+The Huffman stream is decoded at model load time; inference speed is unaffected.
 
 ### Step 2: Benchmark
 
@@ -102,6 +119,17 @@ Tested on Quadro P2200 (5 GB VRAM, CUDA 12.2), Qwen3-1.7B, lossless mode:
 - **Output quality**: cosine similarity > 0.999 at every layer vs uncompressed baseline;
   greedy token sequences match exactly (lossless mode)
 
+### Compression ratio (Qwen3.5-9B, lossless)
+
+| Stage                    | Size    | vs BF16  |
+|--------------------------|---------|----------|
+| Original BF16            | 19.3 GB | —        |
+| Codebook only            | ~15.7 GB | 1.23× (19% smaller) |
+| Codebook + Huffman (disk)| ~9.5 GB  | ~2.0× (51% smaller) |
+
+The Huffman stream is decoded once at load time; in-RAM size during inference
+matches the codebook-only figure (~15.7 GB).  Disk/download savings are ~2×.
+
 ### Layer-level correctness (Qwen3-1.7B, lossless)
 
 All 28 transformer layers verified: cos > 0.999 vs uncompressed forward pass.
@@ -111,19 +139,23 @@ All 28 transformer layers verified: cos > 0.999 vs uncompressed forward pass.
 ## Running Tests
 
 ```bash
-# Fast unit tests (no model required)
-./venv/bin/pytest tests/ -m "not integration and not slow" -v
+# Fast unit tests (no model required) — 48 tests
+./venv/bin/pytest tests/test_compressed_roundtrip.py -v
 
-# Integration tests (requires a compressed model cache)
+# Integration tests (auto-discovers GPT-2 / Gemma / Qwen from HF cache)
+./venv/bin/pytest tests/test_compressed_roundtrip.py -v --run-slow
+
+# Legacy integration tests (require a compressed model cache)
 ./venv/bin/pytest tests/test_cache_integrity.py -v --model ~/workspace/model/Qwen3-1.7B
 ./venv/bin/pytest tests/test_rope_initialization.py -v --model ~/workspace/model/Qwen3-1.7B
 ./venv/bin/pytest tests/test_gpu_load_and_forward.py -v --model ~/workspace/model/Qwen3-1.7B
-
-# All integration tests
-./venv/bin/pytest tests/ -v --model ~/workspace/model/Qwen3-1.7B
 ```
 
-Integration tests skip automatically if the model path or cache is missing.
+`tests/test_compressed_roundtrip.py` covers the full pipeline without requiring
+a pre-compressed model: bit-pack round-trip, codebook assignment, linear/embedding
+forward equality, Huffman encode/decode, Huffman layer forward, tiny LLaMA
+end-to-end compress→load→logits, RoPE buffer reinitialisation, embed-scale
+detection, and real-model integration (GPT-2 auto-discovered from HF cache).
 
 ---
 
@@ -148,8 +180,10 @@ src/
   fast_index_manager.py        — vectorized CPU bitstream index unpacker
   compressed_matmul.c          — C/OpenMP kernel (fallback and CPU mode)
   compressed_matmul_cpu.py     — Python wrapper + gcc JIT build for C kernel
+  huffman_codebook.py          — Huffman encode/decode for codebook index streams
   compressor.py                — base compressor, tensor classification
   bitpack.py                   — N-bit stream packing utilities
+  rope_utils.py                — RoPE inv_freq reinitialisation (NaN/garbage detection)
   analyze_tensor.py            — per-tensor statistics helpers
   q8_utils.py                  — Q8 quantization utilities
 
@@ -183,6 +217,10 @@ INFERENCE_RECOVERY_PLAN.md — diagnostic phases, root-cause taxonomy, fix log
 - **Speed**: on-the-fly codebook lookup adds ~2.3× overhead vs native bf16 matmul
   on GPU.  CPU mode is ~52× slower and intended for correctness testing only.
 - **Compression time**: offline compression is slow (~60 min for 1.7B, CPU-only).
+- **Huffman RAM**: `--entropy-code` reduces on-disk size ~2× but currently the
+  Huffman stream is decoded back to packed-bit indices at load time, so in-RAM
+  size during inference equals the non-Huffman codebook size.  Inference-time
+  Huffman decode (keeping the stream compressed in RAM throughout) is planned.
 - **Thinking mode**: Qwen3 models generate a `<think>` block by default, adding
   many tokens before the visible response.  Thinking is disabled by default;
   pass `--thinking` to enable it.

@@ -223,11 +223,15 @@ class AdaptiveCodebookEmbedding(nn.Module):
         self._gpu_func = None
         self._cached_weight = None
         self._mmap_buf = None  # MmappedPackedBuffer when use_mmap=True
+        # Some models (e.g. Gemma 3) scale embedding outputs by sqrt(hidden_size)
+        # inside the embedding forward.  Preserve that behaviour.
+        self.embed_scale: float = 1.0
 
     def forward(self, x):
         if self.mode == 'exact':
-            return F.embedding(x, self.weight)
-            
+            out = F.embedding(x, self.weight)
+            return out * self.embed_scale if self.embed_scale != 1.0 else out
+
         if self.mode == 'direct_codebook' and self._gpu_func is not None:
             out = self._gpu_func(x)
             # Cast to model dtype and ensure output device matches model device.
@@ -235,7 +239,8 @@ class AdaptiveCodebookEmbedding(nn.Module):
             # the model is on CPU — must move back or subsequent ops produce garbage.
             target = self.codebook.dtype if self.codebook is not None else torch.bfloat16
             # x (token IDs) is always on the model device — use it as device reference.
-            return out.to(device=x.device, dtype=target)
+            out = out.to(device=x.device, dtype=target)
+            return out * self.embed_scale if self.embed_scale != 1.0 else out
 
         if self.mode == 'direct_codebook':
             # Per-token decoding: only decode the rows (token IDs) actually present.
@@ -261,8 +266,9 @@ class AdaptiveCodebookEmbedding(nn.Module):
             unique_embeds = torch.stack(rows, dim=0)  # [num_unique, hidden]
             # Reassemble to original shape [*, hidden]
             out = unique_embeds[inverse].reshape(*x.shape, hidden)
-            return out.to(x.device)
-            
+            out = out.to(x.device)
+            return out * self.embed_scale if self.embed_scale != 1.0 else out
+
         return F.embedding(x, self.weight) # Fallback
 
     @classmethod

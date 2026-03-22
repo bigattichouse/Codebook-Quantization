@@ -81,6 +81,19 @@ class CompressedModelLoader:
         model = self._materialize(model, model_dtype)
         self._load_exact_weights(model, resolver)
 
+        # Re-establish weight tying after to_empty() breaks it.
+        # to_empty() materializes each parameter independently so tied weights
+        # (e.g. GPT-2's lm_head.weight ↔ transformer.wte.weight) become
+        # separate uninitialized tensors.  tie_weights() restores the tie so
+        # lm_head sees the correctly-loaded embedding data.
+        # For direct_codebook models the subsequent module replacement takes
+        # over anyway, so calling tie_weights() here is harmless.
+        if hasattr(model, 'tie_weights'):
+            try:
+                model.tie_weights()
+            except Exception:
+                pass  # not all models support this; not fatal
+
         if self.use_compressed_modules:
             print("\n🚀 STARTING SMART COMPRESSED LOAD")
             self._replace_modules_recursive(model, resolver, self.codebooks)
@@ -247,6 +260,20 @@ class CompressedModelLoader:
             weight_name, data, global_codebooks,
             use_gpu=use_gpu, use_mmap=self.use_mmap, idx_file=idx_file
         )
+
+        # Preserve any output scaling applied by the original embedding forward.
+        # E.g. Gemma3TextScaledWordEmbedding multiplies by sqrt(hidden_size) inside
+        # forward(). The model is in meta/empty state here so we cannot call child()
+        # or read uninitialized tensors — use embedding_dim instead.
+        try:
+            class_name = type(child).__name__
+            if 'Scaled' in class_name or 'scaled' in class_name:
+                hidden = getattr(child, 'embedding_dim', None)
+                if hidden and hidden > 1:
+                    new_layer.embed_scale = float(hidden ** 0.5)
+        except Exception:
+            pass  # not critical — leave embed_scale=1.0
+
         setattr(parent, attr_name, new_layer)
         self.modules_replaced += 1
         # Free the preloaded numpy data now that it lives in the GPU module.
