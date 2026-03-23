@@ -750,7 +750,7 @@ class HuffmanCodebookLinear:
     ):
         self.name  = name
         self.shape = tuple(int(s) for s in shape)
-        self.bits  = bits
+        self.bits  = int(bits)
         M, K = self.shape
 
         phase2_data = all(x is not None for x in (
@@ -892,7 +892,7 @@ class HuffmanCodebookEmbedding:
     ):
         self.name  = name
         self.shape = tuple(int(s) for s in shape)
-        self.bits  = bits
+        self.bits  = int(bits)
         vocab, hidden = self.shape
 
         phase2_data = all(x is not None for x in (

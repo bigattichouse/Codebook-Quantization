@@ -43,7 +43,11 @@ def _build_code_lengths(freq: np.ndarray) -> np.ndarray:
     """
     Build optimal Huffman code lengths from a frequency array.
     Returns uint8 array of code lengths (0 = unused symbol).
-    Length is capped at 24 bits (safe for our GPU LUT; DFloat11 uses the same cap).
+    Length is capped at 32 bits.  Simple truncation at 24 causes overcomplete trees
+    (Kraft sum > 1) for skewed distributions with depths 25-26, which makes
+    canonical code assignment overflow 24 bits and corrupts the bitstream.
+    32-bit cap is always sufficient for realistic LLM weight distributions
+    (natural depths ≤ 28 for up to 65536 unique values) without truncation.
     """
     n = len(freq)
     if n == 0:
@@ -77,7 +81,7 @@ def _build_code_lengths(freq: np.ndarray) -> np.ndarray:
         while node != root:
             node = parent[node]
             depth += 1
-        lengths[sym] = min(depth, 24)  # cap per DFloat11 / DEFLATE convention
+        lengths[sym] = min(depth, 32)  # cap at 32; 24 caused overcomplete trees for depths 25-26
 
     return lengths
 

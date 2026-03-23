@@ -85,7 +85,10 @@ class AdaptiveCodebookLinear(nn.Module):
             # Use GPU-accelerated version. Ensure output lands on the same device as
             # the input — on GPU→CPU fallback the model runs on CPU but _gpu_func
             # returns CUDA tensors, which corrupts subsequent CPU operations.
-            return self._gpu_func(x).to(x.device)
+            out = self._gpu_func(x).to(x.device)
+            if self.bias is not None:
+                out = out + self.bias.to(device=out.device, dtype=out.dtype)
+            return out
             
         if self.mode == 'direct_codebook' and self._huff_data is not None:
             # Huffman inference-time path: Huffman bitstream stays compressed
@@ -167,7 +170,7 @@ class AdaptiveCodebookLinear(nn.Module):
         mode = data['mode']
         shape = data['shape']
         layer = cls(name, shape, mode)
-        layer.bits = data.get('bits', 8)
+        layer.bits = int(data.get('bits', 8))
 
         if mode == 'exact':
             raw = data['data']
@@ -193,40 +196,64 @@ class AdaptiveCodebookLinear(nn.Module):
                     layer.register_buffer('codebook', cb.float(), persistent=False)
 
             # Use reported bit-width
-            layer.bits = data.get('bits', 8)
+            layer.bits = int(data.get('bits', 8))
 
             # Setup GPU acceleration if possible and requested.
             # The GPU object stores indices in VRAM; no CPU RAM copy is needed when
             # GPU is active, so we skip register_buffer('indices') in that case.
             gpu_active = False
 
-            # Huffman-encoded path: keep bitstream in CPU RAM; GPU matmul via
-            # _huff_decode_weights (decode on CPU → upload transiently → GPU matmul).
-            # This is the preferred path: VRAM holds only codebooks + SSM state,
-            # not packed indices — enabling larger models on smaller cards.
-            # The old VRAM-resident Phase 2 path (HuffmanCodebookLinear) is
-            # intentionally bypassed so the stream never lives in VRAM.
-            if data.get('encoding') == 'huffman' and (
-                C_KERNEL_AVAILABLE
-                and data.get('huff_row_bit_starts') is not None
-                and data.get('huff_lut_sym') is not None
-            ):
-                _lens = np.asarray(data['huff_lengths'], dtype=np.uint8)
-                _max  = int(_lens.max()) if _lens.size and _lens.max() > 0 else 1
-                layer._huff_data = {
-                    'huff_stream':    np.asarray(data['huff_stream'],         dtype=np.uint8),
-                    'lut_sym':        np.asarray(data['huff_lut_sym'],        dtype=np.uint16),
-                    'lut_len':        np.asarray(data['huff_lut_len'],        dtype=np.uint8),
-                    'sl_first_code':  np.asarray(data['huff_sl_first_code'],  dtype=np.int64),
-                    'sl_base_offset': np.asarray(data['huff_sl_base_offset'], dtype=np.int32),
-                    'sl_sym':         np.asarray(data['huff_sl_sym'],         dtype=np.uint16),
-                    'row_bit_starts': np.asarray(data['huff_row_bit_starts'], dtype=np.int64),
-                    'sl_max_len':     _max,
-                }
-                layer.register_buffer('indices', None)
-                # gpu_active stays False — no packed indices in VRAM
+            # Huffman-encoded weight: prefer GPU Phase 2 (stream in VRAM, GPU
+            # decode + codebook matmul, no float weight matrix ever created) when
+            # available; fall back to CPU-RAM path (decode per forward pass on CPU)
+            # when GPU is unavailable, use_gpu=False, or GPU setup fails.
+            if data.get('encoding') == 'huffman':
+                _p2_present = (data.get('huff_row_bit_starts') is not None
+                               and data.get('huff_lut_sym') is not None)
+                # GPU Phase 2: upload compressed stream to VRAM; GPU kernel
+                # decodes symbols and accumulates the dot product without
+                # materialising any float32 weight matrix.
+                if (use_gpu and HUFFMAN_AVAILABLE and HIP_AVAILABLE
+                        and hasattr(layer, 'codebook') and layer.codebook is not None):
+                    try:
+                        layer._gpu_func = HuffmanCodebookLinear(
+                            name,
+                            np.asarray(data['huff_stream'],  dtype=np.uint8),
+                            np.asarray(data['huff_lengths'], dtype=np.uint8),
+                            int(data['huff_n'][0]),
+                            layer.codebook, shape, layer.bits,
+                            huff_row_bit_starts = data.get('huff_row_bit_starts') if _p2_present else None,
+                            huff_lut_sym        = data.get('huff_lut_sym')        if _p2_present else None,
+                            huff_lut_len        = data.get('huff_lut_len')        if _p2_present else None,
+                            huff_sl_first_code  = data.get('huff_sl_first_code')  if _p2_present else None,
+                            huff_sl_base_offset = data.get('huff_sl_base_offset') if _p2_present else None,
+                            huff_sl_sym         = data.get('huff_sl_sym')         if _p2_present else None,
+                        )
+                        gpu_active = True
+                    except Exception as e:
+                        print(f"Warning: GPU Huffman setup failed for {name}: {e}")
+                # CPU-RAM fallback: stream stays in CPU RAM; decode per forward pass.
+                # Used when use_gpu=False, no GPU, HUFFMAN_AVAILABLE=False, or GPU failed.
+                if not gpu_active and _p2_present and C_KERNEL_AVAILABLE:
+                    _lens = np.asarray(data['huff_lengths'], dtype=np.uint8)
+                    _max  = int(_lens.max()) if _lens.size and _lens.max() > 0 else 1
+                    layer._huff_data = {
+                        'huff_stream':    np.asarray(data['huff_stream'],         dtype=np.uint8),
+                        'lut_sym':        np.asarray(data['huff_lut_sym'],        dtype=np.uint16),
+                        'lut_len':        np.asarray(data['huff_lut_len'],        dtype=np.uint8),
+                        'sl_first_code':  np.asarray(data['huff_sl_first_code'],  dtype=np.int64),
+                        'sl_base_offset': np.asarray(data['huff_sl_base_offset'], dtype=np.int32),
+                        'sl_sym':         np.asarray(data['huff_sl_sym'],         dtype=np.uint16),
+                        'row_bit_starts': np.asarray(data['huff_row_bit_starts'], dtype=np.int64),
+                        'sl_max_len':     _max,
+                    }
+                    layer.register_buffer('indices', None)
 
-            if layer._huff_data is None and not gpu_active and use_gpu and GPU_ACCELERATED_AVAILABLE and HIP_AVAILABLE and hasattr(layer, 'codebook'):
+            # Standard GPU path for non-Huffman tensors (packed indices in VRAM).
+            if (layer._huff_data is None and not gpu_active and use_gpu
+                    and GPU_ACCELERATED_AVAILABLE and HIP_AVAILABLE
+                    and hasattr(layer, 'codebook')
+                    and data.get('encoding') != 'huffman'):
                 try:
                     layer._gpu_func = GPUAcceleratedLinear(
                         name, data['indices'], layer.codebook, shape, layer.bits
@@ -354,7 +381,7 @@ class AdaptiveCodebookEmbedding(nn.Module):
         mode = data['mode']
         shape = data['shape']
         layer = cls(name, shape, mode)
-        layer.bits = data.get('bits', 8)
+        layer.bits = int(data.get('bits', 8))
 
         if mode == 'exact':
             raw = data['data']
@@ -382,29 +409,53 @@ class AdaptiveCodebookEmbedding(nn.Module):
             # GPU object stores indices in VRAM; no CPU RAM copy needed when GPU active.
             gpu_active = False
 
-            # Huffman path for embedding: keep bitstream in CPU RAM.
-            # Decode only requested token rows on-the-fly; upload to GPU after.
-            if data.get('encoding') == 'huffman' and (
-                C_KERNEL_AVAILABLE
-                and data.get('huff_row_bit_starts') is not None
-                and data.get('huff_lut_sym') is not None
-            ):
-                _lens = np.asarray(data['huff_lengths'], dtype=np.uint8)
-                _max  = int(_lens.max()) if _lens.size and _lens.max() > 0 else 1
-                layer._huff_data = {
-                    'huff_stream':    np.asarray(data['huff_stream'],         dtype=np.uint8),
-                    'lut_sym':        np.asarray(data['huff_lut_sym'],        dtype=np.uint16),
-                    'lut_len':        np.asarray(data['huff_lut_len'],        dtype=np.uint8),
-                    'sl_first_code':  np.asarray(data['huff_sl_first_code'],  dtype=np.int64),
-                    'sl_base_offset': np.asarray(data['huff_sl_base_offset'], dtype=np.int32),
-                    'sl_sym':         np.asarray(data['huff_sl_sym'],         dtype=np.uint16),
-                    'row_bit_starts': np.asarray(data['huff_row_bit_starts'], dtype=np.int64),
-                    'sl_max_len':     _max,
-                }
-                layer.register_buffer('indices', None)
-                # gpu_active stays False — no packed indices in VRAM
+            # Huffman path for embedding: prefer GPU Phase 2 (stream in VRAM,
+            # GPU decode + codebook lookup) when available; fall back to CPU-RAM
+            # per-token on-the-fly decode otherwise.
+            if data.get('encoding') == 'huffman':
+                _p2_present = (data.get('huff_row_bit_starts') is not None
+                               and data.get('huff_lut_sym') is not None)
+                # GPU Phase 2: upload compressed stream to VRAM; GPU kernel decodes.
+                if (use_gpu and HUFFMAN_AVAILABLE and HIP_AVAILABLE
+                        and hasattr(layer, 'codebook') and layer.codebook is not None):
+                    try:
+                        layer._gpu_func = HuffmanCodebookEmbedding(
+                            name,
+                            np.asarray(data['huff_stream'],  dtype=np.uint8),
+                            np.asarray(data['huff_lengths'], dtype=np.uint8),
+                            int(data['huff_n'][0]),
+                            layer.codebook, shape, layer.bits,
+                            huff_row_bit_starts = data.get('huff_row_bit_starts') if _p2_present else None,
+                            huff_lut_sym        = data.get('huff_lut_sym')        if _p2_present else None,
+                            huff_lut_len        = data.get('huff_lut_len')        if _p2_present else None,
+                            huff_sl_first_code  = data.get('huff_sl_first_code')  if _p2_present else None,
+                            huff_sl_base_offset = data.get('huff_sl_base_offset') if _p2_present else None,
+                            huff_sl_sym         = data.get('huff_sl_sym')         if _p2_present else None,
+                        )
+                        gpu_active = True
+                    except Exception as e:
+                        print(f"Warning: GPU Huffman embedding setup failed for {name}: {e}")
+                # CPU-RAM fallback: decode only requested token rows on-the-fly.
+                if not gpu_active and _p2_present and C_KERNEL_AVAILABLE:
+                    _lens = np.asarray(data['huff_lengths'], dtype=np.uint8)
+                    _max  = int(_lens.max()) if _lens.size and _lens.max() > 0 else 1
+                    layer._huff_data = {
+                        'huff_stream':    np.asarray(data['huff_stream'],         dtype=np.uint8),
+                        'lut_sym':        np.asarray(data['huff_lut_sym'],        dtype=np.uint16),
+                        'lut_len':        np.asarray(data['huff_lut_len'],        dtype=np.uint8),
+                        'sl_first_code':  np.asarray(data['huff_sl_first_code'],  dtype=np.int64),
+                        'sl_base_offset': np.asarray(data['huff_sl_base_offset'], dtype=np.int32),
+                        'sl_sym':         np.asarray(data['huff_sl_sym'],         dtype=np.uint16),
+                        'row_bit_starts': np.asarray(data['huff_row_bit_starts'], dtype=np.int64),
+                        'sl_max_len':     _max,
+                    }
+                    layer.register_buffer('indices', None)
 
-            if layer._huff_data is None and not gpu_active and use_gpu and GPU_ACCELERATED_AVAILABLE and HIP_AVAILABLE and hasattr(layer, 'codebook'):
+            # Standard GPU path for non-Huffman embeddings (packed indices in VRAM).
+            if (layer._huff_data is None and not gpu_active and use_gpu
+                    and GPU_ACCELERATED_AVAILABLE and HIP_AVAILABLE
+                    and hasattr(layer, 'codebook')
+                    and data.get('encoding') != 'huffman'):
                 try:
                     layer._gpu_func = GPUAcceleratedEmbedding(
                         name, data['indices'], layer.codebook, shape, layer.bits

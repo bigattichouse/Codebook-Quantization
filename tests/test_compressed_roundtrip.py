@@ -299,6 +299,158 @@ class TestHuffmanRoundtrip:
         )
         assert np.array_equal(decoded, idx)
 
+    def test_deep_tree_no_code_overflow(self):
+        """Regression: skewed distributions with natural depths 25-26 must not
+        produce overcomplete trees (Kraft sum > 1) or canonical codes that
+        overflow 24 bits.  Previously _build_code_lengths capped at 24 using
+        simple truncation, creating invalid codes for such distributions and
+        corrupting the bitstream from the first >16-bit code onward."""
+        from huffman_codebook import huffman_encode_indices, huffman_decode_indices, _canonical_codes
+        # 5000 symbols, many with frequency 1 → natural depths 25-26
+        rng = np.random.default_rng(777)
+        n_syms = 5000
+        # Most symbols appear once; a few hundred appear many times
+        freq = np.ones(n_syms, dtype=np.int64)
+        freq[:200] = rng.integers(1000, 10000, size=200)
+        freq[200:500] = rng.integers(100, 1000, size=300)
+        # Build index stream proportional to frequencies
+        p = freq.astype(np.float64) / freq.sum()
+        n = 4096 * 64
+        idx = rng.choice(n_syms, size=n, p=p).astype(np.uint16)
+        M, K = 4096, 64
+        result = huffman_encode_indices(idx, shape=(M, K))
+        # No code should exceed 32 bits
+        assert result['huff_lengths'].max() <= 32, \
+            f"Code length {result['huff_lengths'].max()} exceeds cap"
+        # All canonical codes must fit in their declared length
+        codes = _canonical_codes(result['huff_lengths'])
+        for sym, (code_val, code_len) in codes.items():
+            assert code_val < (1 << code_len), \
+                f"sym={sym}: code {code_val} overflows {code_len} bits"
+        decoded = huffman_decode_indices(
+            result['huff_stream'], result['huff_lengths'], int(result['huff_n'][0])
+        )
+        assert np.array_equal(decoded, idx), \
+            f"Round-trip failed: {(decoded != idx).sum()} mismatches"
+
+    def test_large_array_uniform(self):
+        """Large N (50M symbols, 8192 unique) with uniform distribution: round-trip."""
+        from huffman_codebook import huffman_encode_indices, huffman_decode_indices
+        M, K = 12288, 4096
+        n = M * K
+        rng = np.random.default_rng(99)
+        idx = rng.integers(0, 8192, size=n, dtype=np.uint16)
+        result = huffman_encode_indices(idx, shape=(M, K))
+        decoded = huffman_decode_indices(
+            result['huff_stream'], result['huff_lengths'], int(result['huff_n'][0])
+        )
+        assert np.array_equal(decoded, idx), \
+            f"Large uniform round-trip: {(decoded != idx).sum()} mismatches"
+
+    def test_large_array_deep_codes(self):
+        """Large N with skewed distribution producing code depths 25+.
+        This is the exact failure mode that caused wrong Qwen inference output."""
+        from huffman_codebook import huffman_encode_indices, huffman_decode_indices
+        # ~5500 unique symbols, many rare (like Qwen3.5-9B large linear layers)
+        M, K = 12288, 4096
+        n = M * K
+        rng = np.random.default_rng(42)
+        n_syms = 5500
+        freq = np.ones(n_syms, dtype=np.float64)
+        freq[:300] = rng.uniform(1000, 50000, 300)
+        freq[300:1000] = rng.uniform(10, 500, 700)
+        p = freq / freq.sum()
+        idx = rng.choice(n_syms, size=n, p=p).astype(np.uint16)
+        result = huffman_encode_indices(idx, shape=(M, K))
+        # Some codes should be longer than 16 bits (exercises slow path)
+        assert result['huff_lengths'].max() > 16, \
+            "Distribution should produce codes > 16 bits to test slow path"
+        decoded = huffman_decode_indices(
+            result['huff_stream'], result['huff_lengths'], int(result['huff_n'][0])
+        )
+        assert np.array_equal(decoded, idx), \
+            f"Large deep-code round-trip: {(decoded != idx).sum()} mismatches"
+
+    def test_c_kernel_large_array_deep_codes(self):
+        """C kernel must correctly decode large arrays with codes > 16 bits."""
+        from huffman_codebook import huffman_encode_indices
+        from compressed_matmul_cpu import C_KERNEL_AVAILABLE, huffman_decode_weights
+        if not C_KERNEL_AVAILABLE:
+            pytest.skip("C kernel unavailable")
+        M, K = 4096, 1024  # smaller for speed, but still triggers slow path
+        n = M * K
+        rng = np.random.default_rng(55)
+        n_syms = 3000
+        freq = np.ones(n_syms, dtype=np.float64)
+        freq[:200] = rng.uniform(500, 10000, 200)
+        p = freq / freq.sum()
+        idx = rng.choice(n_syms, size=n, p=p).astype(np.uint16)
+        codebook = rng.standard_normal(n_syms).astype(np.float32) * 0.02
+        w_expected = codebook[idx].reshape(M, K)
+
+        result = huffman_encode_indices(idx, shape=(M, K))
+        assert result['huff_lengths'].max() > 16, \
+            "Distribution should produce codes > 16 bits"
+
+        _lens = np.asarray(result['huff_lengths'], dtype=np.uint8)
+        sl_max = int(_lens.max()) if _lens.size and _lens.max() > 0 else 1
+        huff_data = {
+            'huff_stream':    np.asarray(result['huff_stream'],         dtype=np.uint8),
+            'lut_sym':        np.asarray(result['huff_lut_sym'],        dtype=np.uint16),
+            'lut_len':        np.asarray(result['huff_lut_len'],        dtype=np.uint8),
+            'sl_first_code':  np.asarray(result['huff_sl_first_code'],  dtype=np.int64),
+            'sl_base_offset': np.asarray(result['huff_sl_base_offset'], dtype=np.int32),
+            'sl_sym':         np.asarray(result['huff_sl_sym'],         dtype=np.uint16),
+            'row_bit_starts': np.asarray(result['huff_row_bit_starts'], dtype=np.int64),
+            'sl_max_len':     sl_max,
+        }
+        w_got = huffman_decode_weights(huff_data, codebook, M, K)
+        max_err = np.abs(w_got - w_expected).max()
+        assert max_err < 1e-6, \
+            f"C kernel large-array decode: max_err={max_err:.2e}"
+
+    def test_gpu_phase2_large_array_deep_codes(self):
+        """GPU Phase 2 must correctly decode large arrays with code depths > 16."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA unavailable")
+        from compressed_modules import AdaptiveCodebookLinear
+        from huffman_codebook import huffman_encode_indices
+        M, K = 4096, 1024
+        n = M * K
+        rng = np.random.default_rng(77)
+        n_syms = 3000
+        freq = np.ones(n_syms, dtype=np.float64)
+        freq[:200] = rng.uniform(500, 10000, 200)
+        p = freq / freq.sum()
+        idx = rng.choice(n_syms, size=n, p=p).astype(np.uint16)
+        codebook = rng.standard_normal(n_syms).astype(np.float32) * 0.02
+        # Build weight matrix as bf16 → float32 roundtrip
+        w_f32 = codebook[idx].reshape(M, K)
+
+        result = huffman_encode_indices(idx, shape=(M, K))
+        assert result['huff_lengths'].max() > 16, \
+            "Distribution should produce codes > 16 bits"
+
+        bits = int(np.ceil(np.log2(max(n_syms, 2))))
+        data = {
+            'mode': 'direct_codebook', 'shape': (M, K), 'bits': bits,
+            'encoding': 'huffman', 'codebook': codebook, 'codebook_type': None,
+            **{k: result[k] for k in ('huff_stream', 'huff_lengths', 'huff_n',
+                                      'huff_lut_sym', 'huff_lut_len',
+                                      'huff_sl_first_code', 'huff_sl_base_offset',
+                                      'huff_sl_sym', 'huff_row_bit_starts')},
+        }
+        layer = AdaptiveCodebookLinear.from_compressed("p2_large_deep", data, {}, use_gpu=True)
+        if layer._gpu_func is None:
+            pytest.skip("GPU func not set (kernel compile failed)")
+        layer.eval()
+
+        x = torch.randn(2, K, device='cuda')
+        out_gpu = layer(x).cpu().float()
+        expected = F.linear(x.cpu(), torch.from_numpy(w_f32))
+        max_err = (out_gpu - expected.float()).abs().max().item()
+        assert max_err < 1e-3, f"GPU Phase 2 large deep-code: max_err={max_err:.2e}"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 6. Huffman-compressed layer forward == uncompressed
@@ -675,15 +827,25 @@ class TestHuffmanGpuMatmulPath:
         )
         return layer, w
 
-    def test_huff_data_set_when_use_gpu(self):
-        """_huff_data is set (not gpu_func) when use_gpu=True and encoding=huffman."""
+    def test_state_when_use_gpu(self):
+        """With use_gpu=True: GPU path sets _gpu_func; CPU fallback sets _huff_data.
+        Either way, packed indices are never allocated."""
         from compressed_matmul_cpu import C_KERNEL_AVAILABLE
         if not C_KERNEL_AVAILABLE:
             pytest.skip("C kernel unavailable")
         layer, _ = self._make_layer(32, 64)
-        assert layer._huff_data is not None, "_huff_data should be set for CPU-RAM path"
-        assert layer._gpu_func is None, "_gpu_func should be None (stream stays in RAM)"
-        assert layer.indices is None, "packed indices should not exist"
+        if torch.cuda.is_available():
+            # GPU machine: HuffmanCodebookLinear is set as _gpu_func (Phase 2 or 1)
+            assert layer._gpu_func is not None, \
+                "_gpu_func should be set to HuffmanCodebookLinear on GPU machine"
+            assert layer._huff_data is None, \
+                "_huff_data not needed when GPU path is active"
+        else:
+            # CPU-only machine: falls back to CPU-RAM path
+            assert layer._huff_data is not None, \
+                "_huff_data should be set as fallback when no GPU"
+            assert layer._gpu_func is None
+        assert layer.indices is None, "packed indices should never be allocated for Huffman"
 
     def test_forward_cpu_x_matches_dense(self):
         """CPU-device x → CPU matmul path still gives correct result."""
@@ -765,6 +927,328 @@ class TestHuffmanGpuMatmulPath:
         vram_delta = vram_after - vram_before
         assert vram_delta < packed_index_size, \
             f"VRAM increased by {vram_delta/1e6:.1f}MB — packed indices may have been uploaded"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6e. GPU Phase 2: Huffman stream lives in VRAM, decoded on GPU without
+#     ever materialising a float weight matrix.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestHuffmanGPUPhase2:
+    """AdaptiveCodebookLinear/Embedding with use_gpu=True uses GPU Phase 2
+    when CUDA is available: Huffman stream is uploaded to VRAM at load time
+    and decoded on-the-fly by the GPU kernel — no full float weight matrix
+    is ever created."""
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    def _make_linear_layer(self, M, K, seed=0, use_gpu=True):
+        from compressed_modules import AdaptiveCodebookLinear
+        rng = np.random.default_rng(seed)
+        w = _bf16_round_trip(rng.standard_normal((M, K)).astype(np.float32) * 0.02)
+        codebook, bits, hd = _make_huff_data(w, (M, K))
+        data = {
+            'mode': 'direct_codebook', 'shape': (M, K), 'bits': bits,
+            'encoding': 'huffman', 'codebook': codebook, 'codebook_type': None,
+            **{k: hd[k] for k in ('huff_stream', 'huff_lengths', 'huff_n',
+                                   'huff_lut_sym', 'huff_lut_len',
+                                   'huff_sl_first_code', 'huff_sl_base_offset',
+                                   'huff_sl_sym', 'huff_row_bit_starts')},
+        }
+        layer = AdaptiveCodebookLinear.from_compressed(
+            f"p2_lin_{M}x{K}_{seed}", data, {}, use_gpu=use_gpu,
+        )
+        return layer, w
+
+    def _make_emb_layer(self, vocab, hidden, seed=0, use_gpu=True):
+        from compressed_modules import AdaptiveCodebookEmbedding
+        rng = np.random.default_rng(seed)
+        w = _bf16_round_trip(rng.standard_normal((vocab, hidden)).astype(np.float32) * 0.02)
+        codebook, bits, hd = _make_huff_data(w, (vocab, hidden))
+        data = {
+            'mode': 'direct_codebook', 'shape': (vocab, hidden), 'bits': bits,
+            'encoding': 'huffman', 'codebook': codebook, 'codebook_type': None,
+            **{k: hd[k] for k in ('huff_stream', 'huff_lengths', 'huff_n',
+                                   'huff_lut_sym', 'huff_lut_len',
+                                   'huff_sl_first_code', 'huff_sl_base_offset',
+                                   'huff_sl_sym', 'huff_row_bit_starts')},
+        }
+        layer = AdaptiveCodebookEmbedding.from_compressed(
+            f"p2_emb_{vocab}x{hidden}_{seed}", data, {}, use_gpu=use_gpu,
+        )
+        return layer, w
+
+    # ── path selection ────────────────────────────────────────────────────────
+
+    def test_gpu_func_set_on_gpu_machine(self):
+        """With use_gpu=True and CUDA available, _gpu_func is set (not _huff_data)."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA unavailable")
+        layer, _ = self._make_linear_layer(32, 64)
+        assert layer._gpu_func is not None, \
+            "_gpu_func should be a HuffmanCodebookLinear instance"
+        assert layer._huff_data is None, \
+            "_huff_data should be None when GPU path is active"
+        assert layer.indices is None
+
+    def test_gpu_func_is_huffman_codebook_linear(self):
+        """_gpu_func must be a HuffmanCodebookLinear instance."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA unavailable")
+        from gpu_huffman_functions import HuffmanCodebookLinear
+        layer, _ = self._make_linear_layer(32, 64)
+        if layer._gpu_func is None:
+            pytest.skip("GPU func not set (kernel compile failed)")
+        assert isinstance(layer._gpu_func, HuffmanCodebookLinear), \
+            f"Expected HuffmanCodebookLinear, got {type(layer._gpu_func)}"
+
+    def test_cpu_fallback_when_use_gpu_false(self):
+        """With use_gpu=False, CPU-RAM path is always used regardless of GPU."""
+        from compressed_matmul_cpu import C_KERNEL_AVAILABLE
+        if not C_KERNEL_AVAILABLE:
+            pytest.skip("C kernel unavailable")
+        layer, _ = self._make_linear_layer(32, 64, use_gpu=False)
+        assert layer._huff_data is not None, \
+            "_huff_data should be set when use_gpu=False"
+        assert layer._gpu_func is None, \
+            "_gpu_func should be None when use_gpu=False"
+        assert layer.indices is None
+
+    def test_embedding_gpu_func_set_on_gpu_machine(self):
+        """Embedding: _gpu_func is set when GPU available and use_gpu=True."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA unavailable")
+        layer, _ = self._make_emb_layer(64, 32)
+        assert layer._gpu_func is not None
+        assert layer._huff_data is None
+
+    # ── stream placement ──────────────────────────────────────────────────────
+
+    def test_phase2_stream_on_gpu_device(self):
+        """Phase 2: huff_stream tensor must live on CUDA, not CPU."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA unavailable")
+        from gpu_huffman_functions import HuffmanCodebookLinear
+        layer, _ = self._make_linear_layer(32, 64)
+        if layer._gpu_func is None:
+            pytest.skip("GPU func not set")
+        func = layer._gpu_func
+        if not isinstance(func, HuffmanCodebookLinear) or func._phase != 2:
+            pytest.skip("Not in Phase 2 mode")
+        assert func._huff_stream.is_cuda, "huff_stream must be on CUDA device in Phase 2"
+        assert func._codebook.is_cuda,    "codebook must be on CUDA device in Phase 2"
+        assert func._lut_sym.is_cuda,     "lut_sym must be on CUDA device in Phase 2"
+
+    def test_phase2_tables_on_gpu(self):
+        """Phase 2: all decode tables (LUTs, slow-path) must live on CUDA."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA unavailable")
+        from gpu_huffman_functions import HuffmanCodebookLinear
+        layer, _ = self._make_linear_layer(32, 64)
+        if layer._gpu_func is None:
+            pytest.skip("GPU func not set")
+        func = layer._gpu_func
+        if not isinstance(func, HuffmanCodebookLinear) or func._phase != 2:
+            pytest.skip("Not in Phase 2 mode")
+        for attr in ('_row_bit_start', '_lut_len', '_sl_first_code',
+                     '_sl_base_offset', '_sl_sym'):
+            t = getattr(func, attr)
+            assert t.is_cuda, f"{attr} must be on CUDA in Phase 2"
+
+    # ── linear correctness ────────────────────────────────────────────────────
+
+    def test_linear_forward_single_token(self):
+        """T=1 (autoregressive) forward on GPU must match F.linear."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA unavailable")
+        M, K = 64, 128
+        layer, w = self._make_linear_layer(M, K)
+        layer.eval()
+        if layer._gpu_func is None:
+            pytest.skip("GPU func not set")
+        x = torch.randn(1, K, device='cuda')
+        expected = F.linear(x.cpu(), torch.from_numpy(w))
+        got = layer(x).cpu()
+        max_err = (got.float() - expected.float()).abs().max().item()
+        assert max_err < 1e-4, f"T=1 GPU mismatch: {max_err:.2e}"
+
+    def test_linear_forward_batch(self):
+        """Batch forward on GPU must match F.linear."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA unavailable")
+        M, K = 64, 128
+        layer, w = self._make_linear_layer(M, K)
+        layer.eval()
+        if layer._gpu_func is None:
+            pytest.skip("GPU func not set")
+        x = torch.randn(8, K, device='cuda')
+        expected = F.linear(x.cpu(), torch.from_numpy(w))
+        got = layer(x).cpu()
+        max_err = (got.float() - expected.float()).abs().max().item()
+        assert max_err < 1e-4, f"Batch GPU mismatch: {max_err:.2e}"
+
+    def test_linear_forward_no_nan(self):
+        """GPU Phase 2 forward must not produce NaN or Inf."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA unavailable")
+        layer, _ = self._make_linear_layer(64, 128, seed=77)
+        layer.eval()
+        if layer._gpu_func is None:
+            pytest.skip("GPU func not set")
+        x = torch.randn(4, 128, device='cuda')
+        out = layer(x)
+        assert not out.isnan().any().item(), "NaN in GPU Phase 2 linear output"
+        assert not out.isinf().any().item(), "Inf in GPU Phase 2 linear output"
+
+    def test_linear_output_on_cuda_device(self):
+        """Output must be on CUDA when input is on CUDA."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA unavailable")
+        layer, _ = self._make_linear_layer(32, 64)
+        layer.eval()
+        if layer._gpu_func is None:
+            pytest.skip("GPU func not set")
+        x = torch.randn(2, 64, device='cuda')
+        out = layer(x)
+        assert out.device.type == 'cuda', f"output on {out.device}, expected cuda"
+
+    def test_linear_with_bias(self):
+        """Bias must be correctly added in GPU Phase 2."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA unavailable")
+        M, K = 32, 64
+        layer, w = self._make_linear_layer(M, K, seed=9)
+        bias = torch.randn(M) * 0.1
+        layer.bias = bias
+        layer.eval()
+        if layer._gpu_func is None:
+            pytest.skip("GPU func not set")
+        x = torch.randn(3, K, device='cuda')
+        expected = F.linear(x.cpu(), torch.from_numpy(w), bias)
+        got = layer(x).cpu()
+        max_err = (got.float() - expected.float()).abs().max().item()
+        assert max_err < 1e-4, f"Bias mismatch: {max_err:.2e}"
+
+    def test_linear_repeated_forward_consistent(self):
+        """Repeated GPU forward calls must produce identical results (determinism)."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA unavailable")
+        M, K = 32, 64
+        layer, _ = self._make_linear_layer(M, K, seed=3)
+        layer.eval()
+        if layer._gpu_func is None:
+            pytest.skip("GPU func not set")
+        x = torch.randn(4, K, device='cuda')
+        with torch.no_grad():
+            out1 = layer(x).clone()
+            out2 = layer(x).clone()
+        assert torch.equal(out1, out2), "GPU Phase 2 forward not deterministic"
+
+    # ── VRAM footprint ────────────────────────────────────────────────────────
+
+    def test_linear_no_full_float_weights_at_rest(self):
+        """After a forward pass, VRAM must not hold a float32[M,K] weight matrix."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA unavailable")
+        M, K = 256, 512
+        layer, _ = self._make_linear_layer(M, K)
+        layer.eval()
+        if layer._gpu_func is None:
+            pytest.skip("GPU func not set")
+        torch.cuda.empty_cache()
+        vram_before = torch.cuda.memory_allocated()
+        x = torch.randn(2, K, device='cuda')
+        with torch.no_grad():
+            _ = layer(x)
+        torch.cuda.empty_cache()
+        vram_after = torch.cuda.memory_allocated()
+        full_weight_f32 = M * K * 4  # bytes if materialised as float32
+        vram_delta = vram_after - vram_before
+        assert vram_delta < full_weight_f32, (
+            f"VRAM grew by {vram_delta/1024:.1f} KB at rest — "
+            f"full float32 weights ({full_weight_f32/1024:.1f} KB) may be permanent"
+        )
+
+    # ── GPU vs CPU numerical agreement ───────────────────────────────────────
+
+    def test_gpu_phase2_matches_cpu_ram_path(self):
+        """GPU Phase 2 output must match CPU-RAM decode path within float32 tolerance."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA unavailable")
+        from compressed_matmul_cpu import C_KERNEL_AVAILABLE
+        if not C_KERNEL_AVAILABLE:
+            pytest.skip("C kernel unavailable (needed for CPU reference)")
+        M, K = 64, 128
+        layer_gpu = self._make_linear_layer(M, K, seed=42, use_gpu=True)[0]
+        layer_cpu = self._make_linear_layer(M, K, seed=42, use_gpu=False)[0]
+        layer_gpu.eval(); layer_cpu.eval()
+        if layer_gpu._gpu_func is None:
+            pytest.skip("GPU func not set")
+        x = torch.randn(4, K)
+        out_gpu = layer_gpu(x.to('cuda')).cpu().float()
+        out_cpu = layer_cpu(x).float()
+        max_err = (out_gpu - out_cpu).abs().max().item()
+        assert max_err < 1e-4, f"GPU vs CPU path mismatch: {max_err:.2e}"
+
+    # ── embedding correctness ─────────────────────────────────────────────────
+
+    def test_embedding_forward_matches_dense(self):
+        """GPU Phase 2 embedding forward must match F.embedding."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA unavailable")
+        vocab, hidden = 64, 32
+        layer, w = self._make_emb_layer(vocab, hidden)
+        layer.eval()
+        if layer._gpu_func is None:
+            pytest.skip("GPU func not set")
+        ids = torch.tensor([0, 5, 10, 63, 0], device='cuda')
+        expected = F.embedding(ids.cpu(), torch.from_numpy(w))
+        got = layer(ids).cpu()
+        max_err = (got.float() - expected.float()).abs().max().item()
+        assert max_err < 1e-4, f"GPU embedding mismatch: {max_err:.2e}"
+
+    def test_embedding_forward_no_nan(self):
+        """GPU Phase 2 embedding must not produce NaN."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA unavailable")
+        layer, _ = self._make_emb_layer(64, 32, seed=7)
+        layer.eval()
+        if layer._gpu_func is None:
+            pytest.skip("GPU func not set")
+        ids = torch.randint(0, 64, (10,), device='cuda')
+        out = layer(ids)
+        assert not out.isnan().any().item(), "NaN in GPU Phase 2 embedding"
+
+    def test_embedding_output_on_cuda_device(self):
+        """Embedding output must be on CUDA when input IDs are on CUDA."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA unavailable")
+        layer, _ = self._make_emb_layer(64, 32)
+        layer.eval()
+        if layer._gpu_func is None:
+            pytest.skip("GPU func not set")
+        ids = torch.tensor([0, 1, 2], device='cuda')
+        out = layer(ids)
+        assert out.device.type == 'cuda', f"output on {out.device}, expected cuda"
+
+    def test_embedding_embed_scale_applied(self):
+        """embed_scale must be multiplied in GPU Phase 2 embedding."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA unavailable")
+        vocab, hidden = 32, 16
+        layer_scaled = self._make_emb_layer(vocab, hidden)[0]
+        layer_plain  = self._make_emb_layer(vocab, hidden)[0]
+        if layer_scaled._gpu_func is None:
+            pytest.skip("GPU func not set")
+        layer_scaled.embed_scale = 3.0
+        layer_scaled.eval(); layer_plain.eval()
+        ids = torch.tensor([0, 1, 2], device='cuda')
+        scaled   = layer_scaled(ids).cpu().float()
+        unscaled = layer_plain(ids).cpu().float()
+        np.testing.assert_allclose(
+            scaled.numpy(), unscaled.numpy() * 3.0, atol=1e-4,
+            err_msg="embed_scale not applied in GPU Phase 2 embedding"
+        )
 
 
 class TestHuffmanInferenceEmbedding:

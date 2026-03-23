@@ -164,7 +164,7 @@ All 28 transformer layers verified: cos > 0.999 vs uncompressed forward pass.
 ## Running Tests
 
 ```bash
-# Fast unit tests (no model required) — 77 tests
+# Fast unit tests (no model required) — 100 tests
 ./venv/bin/pytest tests/test_compressed_roundtrip.py -v
 
 # Integration tests (auto-discovers GPT-2 / Gemma / Qwen from HF cache)
@@ -181,7 +181,8 @@ a pre-compressed model: bit-pack round-trip, codebook assignment, linear/embeddi
 forward equality, Huffman encode/decode, Huffman layer forward, Huffman
 CPU-decode-then-GPU-matmul path, stream-stays-in-CPU-RAM verification, tiny
 LLaMA end-to-end compress→load→logits, RoPE buffer reinitialisation, embed-scale
-detection, and real-model integration (GPT-2 auto-discovered from HF cache).
+detection, large-array Huffman round-trips (50M symbols, deep code distributions),
+and real-model integration (GPT-2 auto-discovered from HF cache).
 
 ---
 
@@ -248,6 +249,12 @@ INFERENCE_RECOVERY_PLAN.md — diagnostic phases, root-cause taxonomy, fix log
   bitstream stays compressed in RAM; each matmul row is decoded on-the-fly using
   a 12-bit LUT (one cache-friendly lookup per weight symbol).  Requires gcc
   (the C/OpenMP kernel); falls back to decode-at-load if gcc is unavailable.
+- **Huffman cache regeneration required after 2026-03-23 fix**: a bug in
+  `_build_code_lengths` (cap of 24 bits via simple truncation) produced invalid
+  Huffman codes for layers whose natural tree depth exceeds 24 (e.g. large linear
+  layers in Qwen3.5-9B with ~5500 unique values).  The cap is now 32 bits.  Any
+  `--entropy-code` cache built before this fix must be regenerated with
+  `compress.py ... --entropy-code --force`.
 - **Thinking mode**: Qwen3 models generate a `<think>` block by default, adding
   many tokens before the visible response.  Thinking is disabled by default;
   pass `--thinking` to enable it.
