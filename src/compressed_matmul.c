@@ -280,6 +280,47 @@ huffman_embedding_f32_rows(
     }
 }
 
+/*
+ * huffman_decode_to_weights_f32
+ *
+ * Decode Huffman stream to a float32 weight matrix [M, K] by doing the
+ * codebook lookup inline per symbol.  No matmul — the caller uploads the
+ * result to GPU and calls a GPU matmul kernel there.
+ *
+ * Same parameter layout as huffman_matmul_f32_chunk but without x / T / out
+ * accumulation.  Output is written (not accumulated), so the caller does NOT
+ * need to zero-initialise out_weights.
+ *
+ *   out_weights : (M, K) float32, row-major — overwritten
+ */
+void
+huffman_decode_to_weights_f32(
+        const uint8_t  *huff_stream,
+        const uint16_t *lut_sym,
+        const uint8_t  *lut_len,
+        const int64_t  *sl_first_code,
+        const int32_t  *sl_base_offset,
+        const uint16_t *sl_sym,
+        const int64_t  *row_bit_starts,
+        const float    *codebook,
+        float          *out_weights,
+        int M, int K, int C, int sl_max_len)
+{
+    #pragma omp parallel for schedule(dynamic, 64)
+    for (int r = 0; r < M; r++) {
+        int64_t bit_pos = row_bit_starts[r];
+        float  *row     = out_weights + (int64_t)r * K;
+        for (int k = 0; k < K; k++) {
+            int sym = huff_decode_one(huff_stream, &bit_pos,
+                                      lut_sym, lut_len,
+                                      sl_first_code, sl_base_offset, sl_sym,
+                                      sl_max_len);
+            if (sym >= C) sym = C - 1;
+            row[k] = codebook[sym];
+        }
+    }
+}
+
 /* ---------------------------------------------------------------------------
  * Bit unpacking helpers
  * ------------------------------------------------------------------------- */

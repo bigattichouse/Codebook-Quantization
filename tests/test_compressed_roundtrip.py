@@ -589,6 +589,184 @@ class TestHuffmanInferenceLinearLayer:
         assert not out.isnan().any().item()
 
 
+class TestHuffmanDecodeWeights:
+    """huffman_decode_weights: Huffman bitstream → float32 weight matrix."""
+
+    def test_decode_matches_original(self):
+        """Decoded weights must equal the original float32 weight matrix."""
+        from compressed_matmul_cpu import C_KERNEL_AVAILABLE, huffman_decode_weights
+        if not C_KERNEL_AVAILABLE:
+            pytest.skip("C kernel unavailable")
+        rng = np.random.default_rng(7)
+        M, K = 16, 32
+        w = _bf16_round_trip(rng.standard_normal((M, K)).astype(np.float32) * 0.02)
+        codebook, bits, hd = _make_huff_data(w, (M, K))
+        decoded = huffman_decode_weights(hd, codebook, M, K)
+        assert decoded.shape == (M, K)
+        assert np.allclose(decoded, w, atol=1e-5), \
+            f"max error: {np.abs(decoded - w).max():.2e}"
+
+    def test_decode_larger_matrix(self):
+        """Larger matrix (128×256) decodes correctly."""
+        from compressed_matmul_cpu import C_KERNEL_AVAILABLE, huffman_decode_weights
+        if not C_KERNEL_AVAILABLE:
+            pytest.skip("C kernel unavailable")
+        rng = np.random.default_rng(13)
+        M, K = 128, 256
+        w = _bf16_round_trip(rng.standard_normal((M, K)).astype(np.float32) * 0.02)
+        codebook, bits, hd = _make_huff_data(w, (M, K))
+        decoded = huffman_decode_weights(hd, codebook, M, K)
+        assert np.allclose(decoded, w, atol=1e-5)
+
+    def test_decode_then_gpu_matmul(self):
+        """decode_weights → GPU matmul gives same result as CPU F.linear."""
+        from compressed_matmul_cpu import C_KERNEL_AVAILABLE, huffman_decode_weights
+        if not C_KERNEL_AVAILABLE:
+            pytest.skip("C kernel unavailable")
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA unavailable")
+        rng = np.random.default_rng(99)
+        M, K = 64, 128
+        w = _bf16_round_trip(rng.standard_normal((M, K)).astype(np.float32) * 0.02)
+        codebook, bits, hd = _make_huff_data(w, (M, K))
+
+        x = torch.randn(3, K)
+        expected = F.linear(x, torch.from_numpy(w))
+
+        weights_np = huffman_decode_weights(hd, codebook, M, K)
+        weights_gpu = torch.from_numpy(weights_np).to('cuda')
+        got = torch.matmul(x.to('cuda').float(), weights_gpu.T).cpu()
+        del weights_gpu
+
+        assert torch.allclose(got, expected, atol=1e-4), \
+            f"GPU matmul mismatch: {(got - expected).abs().max():.2e}"
+
+    def test_decode_no_nan(self):
+        """Decoded weights must not contain NaN or Inf."""
+        from compressed_matmul_cpu import C_KERNEL_AVAILABLE, huffman_decode_weights
+        if not C_KERNEL_AVAILABLE:
+            pytest.skip("C kernel unavailable")
+        rng = np.random.default_rng(42)
+        w = _bf16_round_trip(rng.standard_normal((32, 64)).astype(np.float32) * 0.02)
+        codebook, bits, hd = _make_huff_data(w, (32, 64))
+        decoded = huffman_decode_weights(hd, codebook, 32, 64)
+        assert not np.isnan(decoded).any(), "NaN in decoded weights"
+        assert not np.isinf(decoded).any(), "Inf in decoded weights"
+
+
+class TestHuffmanGpuMatmulPath:
+    """AdaptiveCodebookLinear with _huff_data uses GPU matmul when device=cuda."""
+
+    def _make_layer(self, M, K, seed=0):
+        from compressed_modules import AdaptiveCodebookLinear
+        rng = np.random.default_rng(seed)
+        w = _bf16_round_trip(rng.standard_normal((M, K)).astype(np.float32) * 0.02)
+        codebook, bits, hd = _make_huff_data(w, (M, K))
+        data = {
+            'mode': 'direct_codebook', 'shape': (M, K), 'bits': bits,
+            'encoding': 'huffman', 'codebook': codebook, 'codebook_type': None,
+            **{k: hd[k] for k in ('huff_stream', 'huff_lengths', 'huff_n',
+                                   'huff_lut_sym', 'huff_lut_len',
+                                   'huff_sl_first_code', 'huff_sl_base_offset',
+                                   'huff_sl_sym', 'huff_row_bit_starts')},
+        }
+        layer = AdaptiveCodebookLinear.from_compressed(
+            f"huff_gpu_{M}x{K}_{seed}", data, {}, use_gpu=True
+        )
+        return layer, w
+
+    def test_huff_data_set_when_use_gpu(self):
+        """_huff_data is set (not gpu_func) when use_gpu=True and encoding=huffman."""
+        from compressed_matmul_cpu import C_KERNEL_AVAILABLE
+        if not C_KERNEL_AVAILABLE:
+            pytest.skip("C kernel unavailable")
+        layer, _ = self._make_layer(32, 64)
+        assert layer._huff_data is not None, "_huff_data should be set for CPU-RAM path"
+        assert layer._gpu_func is None, "_gpu_func should be None (stream stays in RAM)"
+        assert layer.indices is None, "packed indices should not exist"
+
+    def test_forward_cpu_x_matches_dense(self):
+        """CPU-device x → CPU matmul path still gives correct result."""
+        from compressed_matmul_cpu import C_KERNEL_AVAILABLE
+        if not C_KERNEL_AVAILABLE:
+            pytest.skip("C kernel unavailable")
+        M, K = 64, 128
+        layer, w = self._make_layer(M, K)
+        layer.eval()
+        x = torch.randn(4, K)
+        expected = F.linear(x, torch.from_numpy(w))
+        got = layer(x)
+        assert torch.allclose(got, expected, atol=1e-4)
+
+    def test_forward_cuda_x_matches_dense(self):
+        """CUDA-device x → GPU matmul path gives same result as dense F.linear."""
+        from compressed_matmul_cpu import C_KERNEL_AVAILABLE, huffman_decode_weights
+        if not C_KERNEL_AVAILABLE:
+            pytest.skip("C kernel unavailable")
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA unavailable")
+        M, K = 64, 128
+        layer, w = self._make_layer(M, K)
+        layer.eval()
+        x_gpu = torch.randn(4, K, device='cuda')
+        expected = F.linear(x_gpu.cpu(), torch.from_numpy(w))
+        got = layer(x_gpu).cpu()
+        assert torch.allclose(got, expected, atol=1e-4), \
+            f"GPU path mismatch: {(got - expected).abs().max():.2e}"
+
+    def test_forward_cuda_output_on_correct_device(self):
+        """Output tensor must be on the same device as input x."""
+        from compressed_matmul_cpu import C_KERNEL_AVAILABLE
+        if not C_KERNEL_AVAILABLE:
+            pytest.skip("C kernel unavailable")
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA unavailable")
+        layer, _ = self._make_layer(32, 64)
+        layer.eval()
+        x_gpu = torch.randn(2, 64, device='cuda')
+        out = layer(x_gpu)
+        assert out.device.type == 'cuda', f"output on {out.device}, expected cuda"
+
+    def test_forward_cuda_no_nan(self):
+        """GPU matmul path must not produce NaN."""
+        from compressed_matmul_cpu import C_KERNEL_AVAILABLE
+        if not C_KERNEL_AVAILABLE:
+            pytest.skip("C kernel unavailable")
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA unavailable")
+        layer, _ = self._make_layer(64, 128, seed=77)
+        layer.eval()
+        x = torch.randn(8, 128, device='cuda')
+        out = layer(x)
+        assert not out.isnan().any().item()
+
+    def test_stream_stays_in_cpu_ram(self):
+        """VRAM allocation must not increase by M*K*2 bytes (packed indices never uploaded)."""
+        from compressed_matmul_cpu import C_KERNEL_AVAILABLE
+        if not C_KERNEL_AVAILABLE:
+            pytest.skip("C kernel unavailable")
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA unavailable")
+        M, K = 256, 512
+        layer, _ = self._make_layer(M, K)
+        layer.eval()
+
+        torch.cuda.empty_cache()
+        vram_before = torch.cuda.memory_allocated()
+        # Trigger one forward pass
+        x = torch.randn(2, K, device='cuda')
+        with torch.no_grad():
+            _ = layer(x)
+        torch.cuda.empty_cache()
+        vram_after = torch.cuda.memory_allocated()
+
+        # At rest, VRAM increase should be only the codebook (small) — NOT M*K*2 bytes
+        packed_index_size = M * K * 2  # 13-bit packed would be M*K*13/8, but uint16 is M*K*2
+        vram_delta = vram_after - vram_before
+        assert vram_delta < packed_index_size, \
+            f"VRAM increased by {vram_delta/1e6:.1f}MB — packed indices may have been uploaded"
+
+
 class TestHuffmanInferenceEmbedding:
     """AdaptiveCodebookEmbedding with Huffman inference-time decode."""
 

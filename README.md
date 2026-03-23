@@ -26,18 +26,21 @@ Short version:
    Optional: add `--entropy-code` to apply Huffman entropy coding on top of
    the codebook indices.  Because the codebook is frequency-sorted (index 0 =
    most common weight value), the index distribution is highly non-uniform
-   (~8 bits/symbol entropy vs 13 bits fixed-width), so Huffman reduces
-   on-disk and in-RAM size by an additional ~40% with zero accuracy cost.
+   (~10.5 bits/symbol actual vs 12-13 bits fixed-width for lossless), so
+   Huffman reduces on-disk and in-RAM size by roughly 1.5× with zero accuracy
+   cost (bit-perfect lossless — pure entropy coding on integer indices).
 
 2. **Load compressed** — model is instantiated on PyTorch's `meta` device
    (zero RAM cost), then `nn.Linear` / `nn.Embedding` modules are swapped for
    `AdaptiveCodebookLinear` / `AdaptiveCodebookEmbedding`.  Only norms, biases,
    and SSM scalars are loaded as exact floats.
 
-   With `--entropy-code`, the Huffman stream is decoded back to packed-bit
-   indices at load time (one-shot CPU decode), then inference proceeds
-   identically to the non-Huffman path.  This saves disk I/O and reduces
-   storage footprint without adding per-token compute overhead.
+   With `--entropy-code`, the Huffman bitstream **stays compressed in CPU RAM
+   throughout inference**.  On each forward pass, each weight matrix is decoded
+   from its bitstream to a transient float32 buffer, uploaded to GPU with
+   `non_blocking=True`, used for one matmul, then immediately freed.  VRAM at
+   rest holds only codebooks and SSM state — enabling models far larger than
+   available VRAM.
 
 3. **Inference** — CUDA kernels compute `out = x @ W` directly from the packed
    index stream and codebook, without ever building the full `W` matrix.  A
@@ -78,8 +81,11 @@ For AMD GPU (MI50 / ROCm) setup, see the MI50_ROCM_SETUP.md doc included with th
 Modes: `lossless` (best quality), `balanced`, `aggressive` (smallest).
 Compression is CPU-only, one-time.  Interrupted runs can be safely resumed.
 
-`--entropy-code` applies canonical Huffman coding to the codebook index stream.
-The Huffman stream is decoded at model load time; inference speed is unaffected.
+`--entropy-code` applies canonical Huffman coding to the codebook index stream
+(bit-perfect lossless).  The Huffman bitstream stays compressed in CPU RAM
+throughout inference; each weight matrix is decoded on the fly per forward pass.
+Pass `--huffman-max-params N` to cap which tensors are Huffman-encoded (default:
+no limit — all tensors encoded).
 
 ### Step 2: Benchmark
 
@@ -121,15 +127,33 @@ Tested on Quadro P2200 (5 GB VRAM, CUDA 12.2), Qwen3-1.7B, lossless mode:
 
 ### Compression ratio (Qwen3.5-9B, lossless)
 
-| Stage                     | Disk     | RAM (inference) | vs BF16  |
-|---------------------------|----------|-----------------|----------|
-| Original BF16             | 19.3 GB  | 19.3 GB         | —        |
-| Codebook only             | ~15.7 GB | ~15.7 GB        | 1.23×    |
-| Codebook + Huffman        | ~9.5 GB  | ~9.5 GB         | ~2.0×    |
+| Stage                     | Disk      | RAM (inference) | vs BF16 | bits/weight |
+|---------------------------|-----------|-----------------|---------|-------------|
+| Original BF16             | 19.31 GB  | 19.31 GB        | —       | 16.0        |
+| Codebook only             | 15.39 GB  | 15.39 GB        | 1.25×   | 12.8        |
+| Codebook + Huffman        | 12.73 GB  | 12.73 GB        | 1.52×   | 10.5        |
 
-With `--entropy-code` the Huffman bitstream stays compressed in RAM throughout
-inference — each matmul row is decoded on-the-fly, so both disk and RAM are ~2×
-smaller than BF16 with no accuracy loss.
+With `--entropy-code` the Huffman bitstream stays compressed in CPU RAM
+throughout inference.  VRAM at rest holds only codebooks + SSM state (~350 MB
+for the 9B model on a 32 GB MI50), making it possible to run the full 9B model
+on a 4–6 GB GPU.
+
+### Inference benchmark (Qwen3.5-9B, AMD MI50 32 GB, ROCm)
+
+| Mode                          | tok/s |  VRAM peak | CPU RAM |
+|-------------------------------|-------|------------|---------|
+| Uncompressed GPU              |  1.39 |  16.7 GB   |  ~1 GB  |
+| Codebook GPU (lossless)       |  9.64 |  13.6 GB   |  ~3 GB  |
+| Huffman GPU (stream in RAM)   |  0.07 |   3.9 GB   | 12.8 GB |
+
+Notes:
+- Codebook GPU is **faster** than uncompressed because it injects an optimised
+  HIP kernel for the GatedDeltaNet (SSM/Mamba) layers present in Qwen3.5-9B.
+- Huffman GPU loads in **9 seconds** (vs minutes for pre-decoded paths) because
+  the bitstream is loaded directly from disk with no up-front decode.
+- Huffman GPU VRAM peak of 3.9 GB is from transient float32 weight buffers
+  (one layer at a time); at rest VRAM is ~350 MB.  This enables running the
+  full 9B model on a card with ≥ 4 GB VRAM at the cost of much lower tok/s.
 
 ### Layer-level correctness (Qwen3-1.7B, lossless)
 
@@ -140,7 +164,7 @@ All 28 transformer layers verified: cos > 0.999 vs uncompressed forward pass.
 ## Running Tests
 
 ```bash
-# Fast unit tests (no model required) — 48 tests
+# Fast unit tests (no model required) — 77 tests
 ./venv/bin/pytest tests/test_compressed_roundtrip.py -v
 
 # Integration tests (auto-discovers GPT-2 / Gemma / Qwen from HF cache)
@@ -154,8 +178,9 @@ All 28 transformer layers verified: cos > 0.999 vs uncompressed forward pass.
 
 `tests/test_compressed_roundtrip.py` covers the full pipeline without requiring
 a pre-compressed model: bit-pack round-trip, codebook assignment, linear/embedding
-forward equality, Huffman encode/decode, Huffman layer forward, tiny LLaMA
-end-to-end compress→load→logits, RoPE buffer reinitialisation, embed-scale
+forward equality, Huffman encode/decode, Huffman layer forward, Huffman
+CPU-decode-then-GPU-matmul path, stream-stays-in-CPU-RAM verification, tiny
+LLaMA end-to-end compress→load→logits, RoPE buffer reinitialisation, embed-scale
 detection, and real-model integration (GPT-2 auto-discovered from HF cache).
 
 ---

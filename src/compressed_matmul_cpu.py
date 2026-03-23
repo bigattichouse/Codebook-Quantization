@@ -196,6 +196,24 @@ def _build_lib():
         ctypes.c_int,                     # sl_max_len
     ]
 
+    # huffman_decode_to_weights_f32
+    lib.huffman_decode_to_weights_f32.restype = None
+    lib.huffman_decode_to_weights_f32.argtypes = [
+        ctypes.POINTER(ctypes.c_uint8),   # huff_stream    uint8[]
+        ctypes.POINTER(ctypes.c_uint16),  # lut_sym        uint16[4096]
+        ctypes.POINTER(ctypes.c_uint8),   # lut_len        uint8[4096]
+        ctypes.POINTER(ctypes.c_int64),   # sl_first_code  int64[max+2]
+        ctypes.POINTER(ctypes.c_int32),   # sl_base_offset int32[max+2]
+        ctypes.POINTER(ctypes.c_uint16),  # sl_sym         uint16[N]
+        ctypes.POINTER(ctypes.c_int64),   # row_bit_starts int64[M]
+        ctypes.POINTER(ctypes.c_float),   # codebook       [C]
+        ctypes.POINTER(ctypes.c_float),   # out_weights    [M, K]
+        ctypes.c_int,                     # M
+        ctypes.c_int,                     # K
+        ctypes.c_int,                     # C
+        ctypes.c_int,                     # sl_max_len
+    ]
+
     return lib
 
 
@@ -540,3 +558,52 @@ def huffman_embedding(token_ids_np, huff_data, codebook_np, H, C=None):
     )
 
     return out_np
+
+
+def huffman_decode_weights(huff_data, codebook_np, M, K, C=None):
+    """
+    Decode a Huffman-compressed weight matrix to float32 [M, K].
+
+    Unlike huffman_matmul this does NOT perform the matrix multiply — it only
+    decodes the Huffman bitstream and does the codebook lookup, producing the
+    full float32 weight matrix.  The caller is responsible for the matmul
+    (typically by uploading the result to GPU and calling torch.matmul there).
+
+    Args:
+        huff_data   : dict from AdaptiveCodebookLinear._huff_data
+        codebook_np : (C,) float32
+        M, K        : weight matrix dimensions
+        C           : codebook size (default len(codebook_np))
+
+    Returns:
+        (M, K) float32 numpy array — freshly allocated, safe to pass to
+        torch.from_numpy() and .to(device, non_blocking=True).
+    """
+    cb_f32 = _as_f32(codebook_np)
+    C_size = C if C is not None else len(cb_f32)
+
+    stream, lut_sym, lut_len, sl_fc, sl_bo, sl_sym, rbs, sl_max = \
+        _coerce_huff_arrays(huff_data)
+
+    lib = _get_lib()
+    if not lib:
+        raise RuntimeError(
+            "huffman_decode_weights requires the C kernel (gcc)."
+        )
+
+    out_weights = np.empty((M, K), dtype=np.float32)
+
+    lib.huffman_decode_to_weights_f32(
+        _ptr_u8(stream),
+        _ptr_u16(lut_sym),
+        _ptr_u8(lut_len),
+        _ptr_i64(sl_fc),
+        _ptr_i32(sl_bo),
+        _ptr_u16(sl_sym),
+        _ptr_i64(rbs),
+        _ptr_f32(cb_f32),
+        _ptr_f32(out_weights),
+        M, K, C_size, sl_max
+    )
+
+    return out_weights

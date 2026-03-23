@@ -63,11 +63,10 @@ def main():
                              'unchanged (expands to fixed-width before GPU upload).\n'
                              'Codebook stored in a separate subdirectory:\n'
                              '  codebook-lossless-huffman/, codebook-30dB-huffman/, etc.')
-    parser.add_argument('--huffman-max-params', type=int, default=10_000_000,
+    parser.add_argument('--huffman-max-params', type=int, default=None,
                         help='Tensors larger than this many parameters fall back to\n'
-                             'fixed-width LCM packing (default: 10M).  Increase to\n'
-                             'Huffman-encode the embedding/lm_head at the cost of\n'
-                             'slower model load.  Only relevant with --entropy-code.')
+                             'fixed-width LCM packing.  Default: no limit (all tensors\n'
+                             'are Huffman-encoded).  Only relevant with --entropy-code.')
     parser.add_argument('--force', action='store_true',
                         help='Recompress even if cache already exists')
     parser.add_argument('--mse-threshold', type=float, default=None,

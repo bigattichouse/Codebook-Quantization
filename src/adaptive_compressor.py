@@ -47,7 +47,7 @@ def _compress_adaptive_worker(name, file_path, offset, size, shape, dtype_str,
                                tensor_name, compression_mode, global_codebooks,
                                mse_threshold=0.0001, native_bits=16, unique_count=None,
                                target_bits=None, entropy_code=False,
-                               huffman_max_params=10_000_000):
+                               huffman_max_params=None):
     """
     Worker function for multi-tier meta-analysis.
 
@@ -108,7 +108,7 @@ def _compress_adaptive_worker(name, file_path, offset, size, shape, dtype_str,
 
         bits = int(np.ceil(np.log2(max(actual_unique, 2))))
         _n_params = len(indices)
-        if entropy_code and _n_params <= huffman_max_params:
+        if entropy_code and (huffman_max_params is None or _n_params <= huffman_max_params):
             _step(f"huffman encoding {_n_params//1_000_000}M indices ({bits}-bit)...")
             from huffman_codebook import huffman_encode_indices
             _wshape = tuple(shape) if len(shape) == 2 else None
@@ -354,7 +354,7 @@ def _compress_adaptive_worker(name, file_path, offset, size, shape, dtype_str,
 
     if best_strategy and min_bits < 16:
         _n_params = len(best_strategy['indices']) if 'indices' in best_strategy else 0
-        if entropy_code and _n_params <= huffman_max_params:
+        if entropy_code and (huffman_max_params is None or _n_params <= huffman_max_params):
             raw_idx = best_strategy['indices']
             _step(f"huffman encoding {len(raw_idx)//1_000_000}M indices ({min_bits}-bit)...")
             from huffman_codebook import huffman_encode_indices
@@ -408,7 +408,7 @@ class AdaptiveCompressor(OnTheFlyCompressor):
                  num_workers: Optional[int] = None, mse_threshold: float = 0.005,
                  target_bits: Optional[int] = None, snr_db: Optional[float] = None,
                  entropy_code: bool = False,
-                 huffman_max_params: int = 10_000_000):
+                 huffman_max_params: Optional[int] = None):
         # Resolve SNR target: explicit --db overrides mode default.
         # Modes are convenience aliases for dB targets; lossless uses absolute MSE.
         if snr_db is not None:
