@@ -133,27 +133,27 @@ Tested on Quadro P2200 (5 GB VRAM, CUDA 12.2), Qwen3-1.7B, lossless mode:
 | Codebook only             | 15.39 GB  | 15.39 GB        | 1.25×   | 12.8        |
 | Codebook + Huffman        | 12.73 GB  | 12.73 GB        | 1.52×   | 10.5        |
 
-With `--entropy-code` the Huffman bitstream stays compressed in CPU RAM
-throughout inference.  VRAM at rest holds only codebooks + SSM state (~350 MB
-for the 9B model on a 32 GB MI50), making it possible to run the full 9B model
-on a 4–6 GB GPU.
+With `--entropy-code` the Huffman bitstream is uploaded to VRAM (GPU Phase 2)
+and decoded in-kernel per matmul, saving ~2.6 GB vs fixed-width indices while
+keeping the stream compressed at all times — no full weight matrix is ever
+materialised.
 
 ### Inference benchmark (Qwen3.5-9B, AMD MI50 32 GB, ROCm)
 
-| Mode                          | tok/s |  VRAM peak | CPU RAM |
-|-------------------------------|-------|------------|---------|
-| Uncompressed GPU              |  1.39 |  16.7 GB   |  ~1 GB  |
-| Codebook GPU (lossless)       |  9.64 |  13.6 GB   |  ~3 GB  |
-| Huffman GPU (stream in RAM)   |  0.07 |   3.9 GB   | 12.8 GB |
+| Mode                             | tok/s |  VRAM peak | CPU RAM |
+|----------------------------------|-------|------------|---------|
+| Uncompressed GPU                 |  1.39 |  16.7 GB   |  ~1 GB  |
+| Codebook GPU (lossless)          |  9.64 |  13.6 GB   |  ~3 GB  |
+| Huffman GPU Phase 2 (in VRAM)    |  0.10 |  11.95 GB  | ~4.2 GB |
 
 Notes:
 - Codebook GPU is **faster** than uncompressed because it injects an optimised
   HIP kernel for the GatedDeltaNet (SSM/Mamba) layers present in Qwen3.5-9B.
-- Huffman GPU loads in **9 seconds** (vs minutes for pre-decoded paths) because
-  the bitstream is loaded directly from disk with no up-front decode.
-- Huffman GPU VRAM peak of 3.9 GB is from transient float32 weight buffers
-  (one layer at a time); at rest VRAM is ~350 MB.  This enables running the
-  full 9B model on a card with ≥ 4 GB VRAM at the cost of much lower tok/s.
+- Huffman GPU Phase 2 loads in **~11 seconds** (vs minutes for pre-decoded paths)
+  because the bitstream is read directly from disk with no up-front decode.
+- Huffman GPU Phase 2 stores the Huffman stream in VRAM and decodes on the fly
+  per matmul using a HIP kernel — saving ~2.6 GB vs fixed-width codebook indices
+  at the cost of ~100× slower tok/s vs codebook-only GPU.
 
 ### Layer-level correctness (Qwen3-1.7B, lossless)
 
