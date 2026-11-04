@@ -194,7 +194,11 @@ chat.py                  — compressed-model interactive chat / single-prompt
 benchmark.py             — three-way benchmark: uncomp GPU / compr GPU / compr CPU
 compare.py               — side-by-side output comparison
 uncompressed_chat.py     — baseline uncompressed inference
-analyze.py               — compression statistics and analysis
+analyze.py               — compression statistics and analysis (safetensors or GGUF)
+survey.py                — cache / level survey; GGUF lossless-headroom survey
+
+analysis/                — one-off analysis scripts (gguf_entropy.py, RLE, sparsity, …)
+diagnostics/             — diag_* scripts, Huffman GPU checks
 
 src/
   adaptive_compressor.py       — two-pass compression pipeline
@@ -213,6 +217,7 @@ src/
   rope_utils.py                — RoPE inv_freq reinitialisation (NaN/garbage detection)
   analyze_tensor.py            — per-tensor statistics helpers
   q8_utils.py                  — Q8 quantization utilities
+  gguf_codes.py                — GGUF quant-code decoders + CPU lossless-headroom scan
 
 tests/
   conftest.py                  — shared fixtures, --model CLI option
@@ -235,6 +240,8 @@ tests/
 SYSTEM_OVERVIEW.md       — detailed technical description
 algorithm.md             — algorithm pseudocode and data-flow diagrams
 INFERENCE_RECOVERY_PLAN.md — diagnostic phases, root-cause taxonomy, fix log
+GGUF_LOSSLESS.md         — can a Q4 GGUF be recompressed losslessly? (~2%: no)
+NEURON_PRUNING.md        — histogram-guided structural neuron pruning design
 ```
 
 ---
@@ -255,6 +262,12 @@ INFERENCE_RECOVERY_PLAN.md — diagnostic phases, root-cause taxonomy, fix log
   layers in Qwen3.5-9B with ~5500 unique values).  The cap is now 32 bits.  Any
   `--entropy-code` cache built before this fix must be regenerated with
   `compress.py ... --entropy-code --force`.
+- **GGUF input**: GGUFs can be surveyed/analyzed (CPU-only), not compressed or
+  run. Lossless recompression of k-quants saves only ~2% — see
+  [GGUF_LOSSLESS.md](./GGUF_LOSSLESS.md).
+- **Test env**: transformers ≥5 requires PyTorch ≥2.6; with an older torch in
+  the venv (e.g. 2.4.1+rocm6.0) transformers disables torch and the
+  model-loading tests error out.
 - **Thinking mode**: Qwen3 models generate a `<think>` block by default, adding
   many tokens before the visible response.  Thinking is disabled by default;
   pass `--thinking` to enable it.
