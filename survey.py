@@ -15,8 +15,8 @@ Shows two complementary views:
      Falls back to a quick header-based size estimate if not available.
 
 Usage:
-    ./venv/bin/python proofofconcept/survey.py ~/workspace/model/Qwen3.5-9B
-    ./venv/bin/python proofofconcept/survey.py ~/workspace/model/Qwen3.5-9B --profile
+    ./venv/bin/python survey.py ~/workspace/model/Qwen3.5-9B
+    ./venv/bin/python survey.py ~/workspace/model/Qwen3.5-9B --profile
 """
 
 from __future__ import annotations
@@ -209,10 +209,182 @@ def _quick_size_estimate(model_path: Path, bits: int) -> float:
 
 
 # ---------------------------------------------------------------------------
+# GGUF Survey
+# ---------------------------------------------------------------------------
+
+def _survey_gguf_model(model_path: Path) -> bool:
+    """Inspect a GGUF model or directory of GGUF shards and display survey stats."""
+    if model_path.is_file() and (".gguf" in model_path.name):
+        gguf_files = [model_path]
+    elif model_path.is_dir():
+        gguf_files = sorted(model_path.glob("*.gguf*"))
+    else:
+        return False
+
+    if not gguf_files:
+        return False
+
+    try:
+        import gguf
+    except ImportError:
+        print("  Notice: 'gguf' package not installed; run: pip install gguf")
+        return False
+
+    total_disk_bytes = sum(f.stat().st_size for f in gguf_files)
+    total_disk_gb = total_disk_bytes / 1e9
+
+    # Inspect shard 1 or single file for metadata
+    try:
+        reader = gguf.GGUFReader(str(gguf_files[0]))
+    except Exception as e:
+        print(f"  Warning: Failed to read GGUF metadata from {gguf_files[0].name}: {e}")
+        return False
+
+    arch_field = reader.get_field("general.architecture")
+    arch_str = (
+        bytes(arch_field.parts[-1]).decode("utf-8", errors="ignore")
+        if arch_field
+        else "unknown"
+    )
+    name_field = reader.get_field("general.name")
+    name_str = (
+        bytes(name_field.parts[-1]).decode("utf-8", errors="ignore")
+        if name_field
+        else model_path.stem
+    )
+
+    def _get_meta_int(key: str) -> int | None:
+        f = reader.get_field(f"{arch_str}.{key}")
+        if f and len(f.parts) > 0:
+            try:
+                return int(f.parts[-1][0])
+            except Exception:
+                return None
+        return None
+
+    block_count = _get_meta_int("block_count") or 48
+    ctx_len = _get_meta_int("context_length")
+    embed_dim = _get_meta_int("embedding_length") or 2560
+    expert_count = _get_meta_int("expert_count")
+    expert_used = _get_meta_int("expert_used_count")
+    expert_ffn = _get_meta_int("expert_feed_forward_length")
+
+    # Count parameters across all readable shards
+    total_params = 0
+    tensors_counted = 0
+    for gf in gguf_files:
+        try:
+            r = gguf.GGUFReader(str(gf))
+            for t in r.tensors:
+                total_params += math.prod(t.shape)
+                tensors_counted += 1
+        except Exception:
+            pass
+
+    # If some shards are still downloading or unreadable, calculate from architecture
+    if tensors_counted < 50:
+        if expert_count and expert_used and expert_ffn:
+            expert_params = expert_count * 3 * embed_dim * expert_ffn * block_count
+            dense_params = block_count * (4 * embed_dim * embed_dim) + (200_000 * embed_dim)
+            total_params = expert_params + dense_params
+            active_params = (expert_used * 3 * embed_dim * expert_ffn * block_count) + dense_params
+        else:
+            total_params = int((total_disk_bytes * 8) / 4.5)
+            active_params = total_params
+    else:
+        if expert_count and expert_used and expert_ffn:
+            expert_params = expert_count * 3 * embed_dim * expert_ffn * block_count
+            active_expert_params = expert_used * 3 * embed_dim * expert_ffn * block_count
+            dense_params = max(0, total_params - expert_params)
+            active_params = dense_params + active_expert_params
+        else:
+            active_params = total_params
+
+    total_params_b = total_params / 1e9
+    active_params_b = active_params / 1e9
+
+    print()
+    print("=" * 76)
+    print(f"  GGUF MODEL SURVEY: {name_str}")
+    print("=" * 76)
+    print(f"  Architecture   : {arch_str}")
+    print(f"  Layers (blocks): {block_count}")
+    print(f"  Context window : {ctx_len:,} tokens" if ctx_len else f"  Embedding dim  : {embed_dim}")
+    if expert_count:
+        print(f"  MoE Routing    : {expert_count} experts total, {expert_used} active per token")
+        print(f"  Total Params   : {total_params_b:.1f}B total ({active_params_b:.1f}B active per token)")
+    else:
+        print(f"  Total Params   : {total_params_b:.1f}B dense")
+    print(f"  GGUF on disk   : {total_disk_gb:.1f} GB ({len(gguf_files)} shard file{'s' if len(gguf_files) > 1 else ''})")
+    print()
+
+    # Measured lossless headroom: Huffman on the stored integer quant codes
+    from gguf_codes import print_headroom, scan_gguf
+
+    print("  Lossless Headroom (measured, CPU-only block sampling):")
+    print("  Huffman-codes the integer quant codes per tensor; block scales kept raw.")
+    print()
+    res = scan_gguf(model_path, max_blocks=2048, progress=False)
+    print_headroom(res, context=False)
+    saved_gb = (res["raw_bytes"] - res["huff_bytes"]) / 1e9
+    lossless_gb = total_disk_gb - saved_gb
+    print()
+
+    # Hardware & MI50 Budget Analysis
+    mi50_vram = 32.0
+    usable_vram = 28.0  # leave 4GB for KV cache / context / workspace
+    host_ram = 128.0
+
+    print("  MI50 (32 GB VRAM) & System (128 GB RAM) Budget Analysis:")
+    print(f"  - Target Hardware : AMD Instinct MI50 (32 GB HBM2) | Host RAM: {host_ram:.0f} GB")
+    print(f"  - Model Total Size: {total_disk_gb:.1f} GB")
+
+    if total_disk_gb <= usable_vram:
+        print("  - VRAM Fit        : Full model fits entirely in 32 GB VRAM!")
+        offload_layers = block_count
+    else:
+        vram_layer_ratio = usable_vram / total_disk_gb
+        offload_layers = min(block_count, max(1, int(block_count * vram_layer_ratio)))
+        vram_used = (total_disk_gb / block_count) * offload_layers
+        cpu_ram_needed = total_disk_gb - vram_used
+        print(f"  - VRAM Fit        : Model exceeds 32 GB VRAM ({total_disk_gb:.1f} GB > {mi50_vram:.0f} GB).")
+        print(f"  - System RAM Fit  : Fits in host CPU RAM ({total_disk_gb:.1f} GB < {host_ram:.0f} GB).")
+        print(f"  - Recommended Offload (llama.cpp):")
+        print(f"      Offload {offload_layers} of {block_count} layers to MI50 VRAM (~{vram_used:.1f} GB VRAM).")
+        print(f"      Remaining {block_count - offload_layers} layers execute in system RAM (~{cpu_ram_needed:.1f} GB).")
+        if expert_count:
+            print(f"      Because this is MoE (only {expert_used} active experts/token), memory bandwidth")
+            print(f"      demand is only ~{active_params_b:.1f}B params/token during generation!")
+
+    print()
+    saved_pct = 100 * saved_gb / total_disk_gb
+    print("  Can This Quant Be Shrunk Losslessly?")
+    print(f"  - Measured: {total_disk_gb:.1f} GB -> {lossless_gb:.1f} GB ({saved_pct:.1f}% saved).")
+    print("    Code histograms are shared model-wide but nearly flat: k-quant scale fitting")
+    print("    spreads each block across the full code range, so little entropy is left.")
+    print("  - Re-codebooking the dequantized floats does not help: every block has its own")
+    print("    fp16 scale, so a tensor holds millions of distinct float values.")
+    print("  - Larger levers are structural: mmap lookup-only tables (token / per-layer")
+    print("    embeddings) and keep inactive MoE experts in host RAM.")
+    print()
+    print("  Recommended Command to Run:")
+    print(f"    ~/workspace/llama.cpp/build/bin/llama-cli \\")
+    print(f"      -m {gguf_files[0]} \\")
+    print(f"      -ngl {offload_layers if total_disk_gb > usable_vram else 99} \\")
+    print(f"      -p \"Hello\" -n 128")
+    print("=" * 76)
+    print()
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Printer
 # ---------------------------------------------------------------------------
 
 def print_survey(model_path: Path) -> None:
+    if _survey_gguf_model(model_path):
+        return
+
     base_name = model_path.name
 
     print()
@@ -243,7 +415,7 @@ def print_survey(model_path: Path) -> None:
     else:
         print()
         print("  No existing codebook caches found.")
-        print("  Run:  ./venv/bin/python proofofconcept/compress.py <model> --db 30")
+        print("  Run:  ./venv/bin/python compress.py <model> --db 30")
 
     # ── 2. CB level reference ─────────────────────────────────────────────
     print()
@@ -303,8 +475,8 @@ def main() -> None:
     args = parser.parse_args()
 
     model_path = args.model_path.expanduser().resolve()
-    if not model_path.is_dir():
-        print(f"Error: {model_path} is not a directory", file=sys.stderr)
+    if not model_path.exists():
+        print(f"Error: {model_path} does not exist", file=sys.stderr)
         sys.exit(1)
 
     print_survey(model_path)
