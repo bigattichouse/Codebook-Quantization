@@ -25,9 +25,9 @@ import pytest
 import torch
 
 # ── path setup ──────────────────────────────────────────────────────────────
-ROOT = Path(__file__).parent.parent.parent
-SRC = ROOT / "proofofconcept" / "src"
-SCRIPT_DIR = ROOT / "proofofconcept"
+ROOT = Path(__file__).parent.parent
+SRC = ROOT / "src"
+SCRIPT_DIR = ROOT
 sys.path.insert(0, str(SRC))
 sys.path.insert(0, str(SCRIPT_DIR))
 

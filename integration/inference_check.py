@@ -8,9 +8,9 @@ The model must already have a compression cache (run compress.py first).
 Works on CPU, NVIDIA CUDA, and AMD ROCm — no hardware-specific assumptions.
 
 Usage:
-    python proofofconcept/integration/inference_check.py /path/to/model
-    python proofofconcept/integration/inference_check.py /path/to/model --device cpu
-    python proofofconcept/integration/inference_check.py /path/to/model --device cuda
+    python integration/inference_check.py /path/to/model
+    python integration/inference_check.py /path/to/model --device cpu
+    python integration/inference_check.py /path/to/model --device cuda
 """
 
 import argparse
@@ -87,7 +87,7 @@ def check_compression_cache(model_path: Path):
         return True
     else:
         print(f"  No cache found at: {cache}")
-        print(f"  Run first:  python proofofconcept/compress.py {model_path}")
+        print(f"  Run first:  python compress.py {model_path}")
         return False
 
 

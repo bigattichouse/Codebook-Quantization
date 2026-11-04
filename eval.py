@@ -8,9 +8,9 @@ Lower = better.  A pure INT8 linear-quantized 9B model typically adds
 as the quality bar for balanced compression.
 
 Usage:
-    python proofofconcept/eval.py ~/workspace/model/Qwen3.5-9B --mode lossless
-    python proofofconcept/eval.py ~/workspace/model/Qwen3.5-9B --mode balanced
-    python proofofconcept/eval.py ~/workspace/model/Qwen3.5-9B --mode uncompressed
+    ./venv/bin/python eval.py ~/workspace/model/Qwen3.5-9B --mode lossless
+    ./venv/bin/python eval.py ~/workspace/model/Qwen3.5-9B --mode balanced
+    ./venv/bin/python eval.py ~/workspace/model/Qwen3.5-9B --mode uncompressed
 
 Compare the PPL values across modes:
     uncompressed  → baseline

@@ -25,10 +25,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-PROJECT_ROOT = Path(__file__).parent.parent.parent
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT / 'src'))
 sys.path.insert(0, str(PROJECT_ROOT))
-sys.path.insert(0, str(PROJECT_ROOT / 'proofofconcept' / 'src'))
-sys.path.insert(0, str(PROJECT_ROOT / 'proofofconcept'))
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 

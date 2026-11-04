@@ -9,7 +9,7 @@ This script converts each .npz to an uncompressed .npz (plain zip, no deflate)
 which np.load() reads 4–6× faster at the cost of ~15–30% more disk space.
 
 Usage:
-    python proofofconcept/convert_cache_to_fast.py ~/workspace/model/Qwen3.5-9B
+    ./venv/bin/python convert_cache_to_fast.py ~/workspace/model/Qwen3.5-9B
 
 The originals are kept with a .npz.gz backup extension.  Re-run with --restore
 to revert to the compressed originals.

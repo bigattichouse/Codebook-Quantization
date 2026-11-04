@@ -8,7 +8,9 @@ import sys, time, gc
 import torch
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent / 'src'))
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / 'src'))
+sys.path.insert(0, str(ROOT))
 
 from chat import CompressedChatModel
 

@@ -7,7 +7,10 @@ import sys, os, time
 import numpy as np
 import torch
 
-sys.path.insert(0, 'src')
+from pathlib import Path
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / 'src'))
+sys.path.insert(0, str(ROOT))
 
 # Force CPU-RAM path by patching compressed_modules before import
 import compressed_modules as cm

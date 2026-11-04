@@ -7,7 +7,10 @@ import numpy as np
 import torch
 import time
 
-sys.path.insert(0, 'src')
+from pathlib import Path
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / 'src'))
+sys.path.insert(0, str(ROOT))
 
 from compressed_modules import AdaptiveCodebookLinear, AdaptiveCodebookEmbedding
 

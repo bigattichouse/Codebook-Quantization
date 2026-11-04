@@ -11,18 +11,18 @@ offload layers to CPU when VRAM is full.  This can be slow but avoids an OOM
 crash.  Use --skip-uncompressed if you only want to measure the compressed run.
 
 The compressed run requires a pre-built codebook cache.  Build it first:
-    ./venv/bin/python proofofconcept/compress.py ~/workspace/model/Qwen3.5-9B
+    ./venv/bin/python compress.py ~/workspace/model/Qwen3.5-9B
 
 Usage:
     # Full comparison (uncompressed first, then compressed):
-    ./venv/bin/python proofofconcept/compare.py ~/workspace/model/Qwen3.5-9B
+    ./venv/bin/python compare.py ~/workspace/model/Qwen3.5-9B
 
     # With custom prompt and token count:
-    ./venv/bin/python proofofconcept/compare.py ~/workspace/model/Qwen3.5-9B \\
+    ./venv/bin/python compare.py ~/workspace/model/Qwen3.5-9B \
         --prompt "Write a haiku about data compression" --tokens 80
 
     # Compressed-only (skip potentially slow/dangerous uncompressed run):
-    ./venv/bin/python proofofconcept/compare.py ~/workspace/model/Qwen3.5-9B \\
+    ./venv/bin/python compare.py ~/workspace/model/Qwen3.5-9B \
         --skip-uncompressed
 """
 
@@ -234,7 +234,7 @@ def run_compressed(model_path: Path, prompt: str, max_tokens: int,
     cache_tensors = model_path / 'codebook' / 'tensors'
     if not cache_tensors.exists() or len(list(cache_tensors.glob('*.npz'))) == 0:
         print(f"\n  No compression cache found.")
-        print(f"  Run first: ./venv/bin/python proofofconcept/compress.py {model_path}")
+        print(f"  Run first: ./venv/bin/python compress.py {model_path}")
         return None
 
     ram0 = _ram_gb()

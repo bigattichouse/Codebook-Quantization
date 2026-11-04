@@ -23,9 +23,9 @@ from typing import Optional
 import torch
 from transformers import AutoConfig, AutoTokenizer
 
-PROJECT_ROOT = Path(__file__).parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
-sys.path.insert(0, str(Path(__file__).parent / 'src'))
+sys.path.insert(0, str(PROJECT_ROOT / 'src'))
 
 from adaptive_compressor import AdaptiveCompressor
 from model_loader import CompressedModelLoader
@@ -94,7 +94,7 @@ class CompressedChatModel:
         cache_tensors = _tmp_compressor.cache_dir / 'tensors'
         if not cache_tensors.exists() or not list(cache_tensors.glob('*.npz')):
             print(f"\nError: No compression cache at {cache_tensors}")
-            print(f"Run: python proofofconcept/compress.py {self.model_path} --mode {self.compression_mode}")
+            print(f"Run: python compress.py {self.model_path} --mode {self.compression_mode}")
             return None
 
         # -- Config & tokenizer -------------------------------------------

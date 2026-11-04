@@ -6,7 +6,7 @@ Checks the GPU environment (NVIDIA CUDA or AMD ROCm), PyTorch integration,
 and compression kernel compilation.  No model required.
 
 Usage:
-    python proofofconcept/integration/gpu_setup_check.py
+    python integration/gpu_setup_check.py
 """
 
 import os

@@ -32,9 +32,16 @@ from pathlib import Path
 
 import numpy as np
 
-# Locate quantization/ package relative to this script
-_QUANT_DIR = Path(__file__).resolve().parent.parent / "quantization"
-sys.path.insert(0, str(_QUANT_DIR))
+# Locate Adaptive-Quantization or quantization package relative to this script
+_CANDIDATE_DIRS = [
+    Path(__file__).resolve().parent.parent.parent / "Adaptive-Quantization",
+    Path(__file__).resolve().parent.parent.parent / "quantization",
+    Path(__file__).resolve().parent.parent / "quantization",
+]
+for _qd in _CANDIDATE_DIRS:
+    if _qd.exists():
+        sys.path.insert(0, str(_qd))
+        break
 
 from src.quant_sim import QUANT_LEVELS
 from src.codebook_sim import CODEBOOK_LEVELS

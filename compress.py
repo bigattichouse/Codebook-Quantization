@@ -21,10 +21,10 @@ You can specify any dB target directly with --db:
 Multiple quality tiers can coexist under the same model directory.
 
 Usage:
-    ./venv/bin/python proofofconcept/compress.py ~/workspace/model/Qwen3.5-9B
-    ./venv/bin/python proofofconcept/compress.py ~/workspace/model/Qwen3.5-9B --mode lossless
-    ./venv/bin/python proofofconcept/compress.py ~/workspace/model/Qwen3.5-9B --db 35
-    ./venv/bin/python proofofconcept/compress.py ~/workspace/model/Qwen3.5-9B --force
+    ./venv/bin/python compress.py ~/workspace/model/Qwen3.5-9B
+    ./venv/bin/python compress.py ~/workspace/model/Qwen3.5-9B --mode lossless
+    ./venv/bin/python compress.py ~/workspace/model/Qwen3.5-9B --db 35
+    ./venv/bin/python compress.py ~/workspace/model/Qwen3.5-9B --force
 """
 
 import sys
@@ -179,7 +179,7 @@ def main():
         print(f"Location: {cache_tensors}")
     print(f"{'='*70}\n")
     print("Next step: run inference with")
-    print(f"  ./venv/bin/python proofofconcept/chat.py {model_path} --mode {args.mode}")
+    print(f"  ./venv/bin/python chat.py {model_path} --mode {args.mode}")
 
 
 if __name__ == '__main__':

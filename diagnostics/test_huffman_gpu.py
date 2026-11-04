@@ -9,8 +9,10 @@ Tests a tiny known stream end-to-end, printing each intermediate value so the
 exact failure point is visible.
 """
 
-import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+from pathlib import Path
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / 'src'))
+sys.path.insert(0, str(ROOT))
 
 import numpy as np
 import torch
