@@ -1,0 +1,3 @@
+Can we apply codebook quanitzation to KV cache and stuff to keep it small ... reviewing it on turns and compressing as necessary (or periodic)?
+
+A slightly slower cache (or other attention mechanisms and session specific context info) would be great if we could drastically increase context size without loss.

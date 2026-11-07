@@ -199,6 +199,7 @@ survey.py                — cache / level survey; GGUF lossless-headroom survey
 
 analysis/                — one-off analysis scripts (gguf_entropy.py, RLE, sparsity, …)
 diagnostics/             — diag_* scripts, Huffman GPU checks
+kv_cache_experiment/     — KV-cache/session compression PoC (gemma-3-270m .ggsn)
 
 src/
   adaptive_compressor.py       — two-pass compression pipeline
@@ -242,6 +243,9 @@ algorithm.md             — algorithm pseudocode and data-flow diagrams
 INFERENCE_RECOVERY_PLAN.md — diagnostic phases, root-cause taxonomy, fix log
 GGUF_LOSSLESS.md         — can a Q4 GGUF be recompressed losslessly? (~2%: no)
 NEURON_PRUNING.md        — histogram-guided structural neuron pruning design
+kv_cache_experiment/REPORT.md — KV-cache/session compression: ggsn layout,
+                                 lossless + codebook vs built-in Q8_0 (41.8 dB),
+                                 bit-depth sweep 4..16, chart.html
 ```
 
 ---

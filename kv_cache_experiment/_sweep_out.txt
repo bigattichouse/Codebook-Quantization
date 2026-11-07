@@ -1,0 +1,47 @@
+raw f16 KV = 7,575,552 bytes; codebook scale overhead = 0.0389 b/val (1 f16 / 411); q8_0 block overhead = 0.500 b/val (1 f16 / 32)
+
+### A. codebook: per-channel clip @ p99.9  (robust; outlier-tolerant) ###
+bits |  SNR K  SNR V | raw b/val size MB     x | huff b/val size MB     x | clip%
+---------------------------------------------------------------------------------
+   4 |    9.7    9.2 |      4.04    1.91  3.96 |       1.80    0.85  8.89 |  0.11
+   5 |   16.4   16.2 |      5.04    2.39  3.18 |       2.59    1.23  6.18 |  0.11
+   6 |   21.7   21.7 |      6.04    2.86  2.65 |       3.54    1.68  4.52 |  0.11
+   7 |   24.8   25.1 |      7.04    3.33  2.27 |       4.53    2.15  3.53 |  0.11
+   8 |   26.0   26.6 |      8.04    3.81  1.99 |       5.53    2.62  2.89 |  0.11
+   9 |   26.4   27.1 |      9.04    4.28  1.77 |       6.53    3.09  2.45 |  0.11
+  10 |   26.5   27.2 |     10.04    4.75  1.59 |       7.53    3.57  2.12 |  0.11
+  11 |   26.5   27.2 |     11.04    5.23  1.45 |       8.53    4.04  1.87 |  0.11
+  12 |   26.5   27.3 |     12.04    5.70  1.33 |       9.53    4.51  1.68 |  0.11
+  14 |   26.5   27.3 |     14.04    6.65  1.14 |      11.53    5.46  1.39 |  0.11
+  16 |   26.5   27.3 |     16.04    7.59  1.00 |      13.51    6.40  1.18 |  0.11
+
+### A. codebook: per-channel max scale, NO clip  (best SNR; one outlier per channel eats resolution) ###
+bits |  SNR K  SNR V | raw b/val size MB     x | huff b/val size MB     x | clip%
+---------------------------------------------------------------------------------
+   4 |    6.8    6.7 |      4.04    1.91  3.96 |       1.56    0.74 10.26 |  0.00
+   5 |   14.0   14.1 |      5.04    2.39  3.18 |       2.20    1.04  7.29 |  0.00
+   6 |   20.6   20.7 |      6.04    2.86  2.65 |       3.09    1.46  5.18 |  0.00
+   7 |   26.9   27.0 |      7.04    3.33  2.27 |       4.07    1.93  3.94 |  0.00
+   8 |   33.0   33.0 |      8.04    3.81  1.99 |       5.06    2.40  3.16 |  0.00
+   9 |   39.1   39.1 |      9.04    4.28  1.77 |       6.06    2.87  2.64 |  0.00
+  10 |   45.1   45.1 |     10.04    4.75  1.59 |       7.06    3.34  2.27 |  0.00
+  11 |   51.2   51.1 |     11.04    5.23  1.45 |       8.06    3.82  1.98 |  0.00
+  12 |   57.2   57.2 |     12.04    5.70  1.33 |       9.06    4.29  1.77 |  0.00
+  14 |   69.2   69.2 |     14.04    6.65  1.14 |      11.06    5.24  1.45 |  0.00
+  16 |   81.3   81.3 |     16.04    7.59  1.00 |      13.05    6.18  1.23 |  0.00
+
+=== B/C. built-in Q8_0 (llama.cpp ggml, blocks of 32, f16 scale) ===
+B. built-in Q8_0 raw:        8.00 + 0.500 ovh = 8.50 b/val -> 4.02 MB (1.88x), SNR K 42.1 / V 41.8 dB
+C. built-in Q8_0 + Huffman:  7.35 + 0.500 ovh = 7.85 b/val -> 3.72 MB (2.04x), SNR unchanged (K 42.1 / V 41.8 dB)
+   index entropy savings: 0.65 bits/val = 8.1% of the raw index width
+   top 10% of distinct indices carry 32.8% of values
+   top 25% of distinct indices carry 62.4% of values
+   top 50% of distinct indices carry 86.5% of values
+
+=== head-to-head, 8-bit family (SNR dB, Huffman b/val, MB, x) ===
+A codebook Q8 clipped  : SNR 26.0  huff 5.53 b/val  2.62 MB  x2.89
+A codebook Q8 no-clip  : SNR 33.0  huff 5.06 b/val  2.40 MB  x3.16
+B built-in Q8_0 raw    : SNR 41.8  raw  8.50 b/val  4.02 MB  x1.88
+C built-in Q8_0 +Huff  : SNR 41.8  huff 7.85 b/val  3.72 MB  x2.04
+
+chart written: /home/bigattichouse/workspace/Codebook-Quantization/kv_cache_experiment/chart.html
